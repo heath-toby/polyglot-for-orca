@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.Orca.Polyglot" path="/org/gnome/orca/polyglot/">
+    <key name="enabled" type="b">
+      <default>true</default>
+      <summary>Enable automatic language switching</summary>
+    </key>
+    <key name="word-threshold" type="i">
+      <default>2</default>
+      <summary>Words before switching language</summary>
+    </key>
+    <key name="speak-emojis" type="b">
+      <default>true</default>
+      <summary>Speak emojis by name</summary>
+    </key>
+    <key name="unicode-verbosity" type="s">
+      <default>'brief'</default>
+      <summary>Unicode character name verbosity (off, brief, verbose)</summary>
+    </key>
+    <key name="default-language" type="s">
+      <default>'en'</default>
+      <summary>Default language code</summary>
+    </key>
+    <key name="enabled-languages" type="as">
+      <default>[]</default>
+      <summary>List of enabled language codes</summary>
+    </key>
+    <key name="script-to-language" type="a{ss}">
+      <default>{}</default>
+      <summary>Mapping of Unicode scripts to language codes</summary>
+    </key>
+    <key name="switch-confidence" type="d">
+      <default>0.92</default>
+      <summary>Confidence threshold for switching away from default language</summary>
+    </key>
+    <key name="speak-emoticons" type="b">
+      <default>true</default>
+      <summary>Speak text emoticons by name</summary>
+    </key>
+    <key name="enable-mixed-language" type="b">
+      <default>false</default>
+      <summary>Split mixed-language text into segments</summary>
+    </key>
+    <key name="language-switch-pause" type="d">
+      <default>0.3</default>
+      <summary>Pause duration between language switches in seconds</summary>
+    </key>
+    <key name="ignored-apps" type="as">
+      <default>[]</default>
+      <summary>Applications excluded from language detection</summary>
+    </key>
+  </schema>
+  <schema id="org.gnome.Orca.Polyglot.Language">
+    <!-- Relocatable schema, instantiated at /org/gnome/orca/polyglot/languages/{code}/ -->
+    <key name="voice-name" type="s">
+      <default>''</default>
+      <summary>Speech Dispatcher voice name</summary>
+    </key>
+    <key name="voice-lang" type="s">
+      <default>''</default>
+      <summary>Voice language code</summary>
+    </key>
+    <key name="voice-dialect" type="s">
+      <default>''</default>
+      <summary>Voice dialect/variant</summary>
+    </key>
+    <key name="rate" type="d">
+      <default>50.0</default>
+      <summary>Speech rate</summary>
+    </key>
+    <key name="average-pitch" type="d">
+      <default>5.0</default>
+      <summary>Voice pitch</summary>
+    </key>
+    <key name="gain" type="d">
+      <default>10.0</default>
+      <summary>Voice volume/gain</summary>
+    </key>
+    <key name="contraction-table" type="s">
+      <default>''</default>
+      <summary>Braille contraction table path</summary>
+    </key>
+  </schema>
+</schemalist>

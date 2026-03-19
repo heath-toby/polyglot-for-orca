@@ -1,0 +1,35 @@
+[/]
+default-language='en'
+enabled=true
+enabled-languages=['de', 'en', 'ru']
+script-to-language={'CYRILLIC': 'ru', 'IPA': 'ipa'}
+speak-emojis=true
+unicode-verbosity='brief'
+word-threshold=3
+
+[languages/de]
+average-pitch=5.0
+contraction-table='/usr/share/liblouis/tables/de-g1-detailed.ctb'
+gain=5.0
+rate=65.0
+voice-dialect=''
+voice-lang='de'
+voice-name='viktor-embedded-high'
+
+[languages/en]
+average-pitch=5.0
+contraction-table='/usr/share/liblouis/tables/en-ueb-g2.ctb'
+gain=5.0
+rate=100.0
+voice-dialect='GB'
+voice-lang='en'
+voice-name='daniel-embedded-high'
+
+[languages/ru]
+average-pitch=5.0
+contraction-table='/usr/share/liblouis/tables/ru-litbrl-detailed.utb'
+gain=5.0
+rate=63.0
+voice-dialect=''
+voice-lang='ru'
+voice-name='yuri-embedded-high'
