@@ -48,6 +48,13 @@ if [ -d "$OLD_ADDON_DIR" ] && [ ! -d "$ADDON_DIR" ]; then
     info "Migrating from orca_autoswitch to polyglot..."
     cp -a "$OLD_ADDON_DIR" "$ADDON_DIR"
 
+    # The venv's interpreter shebangs hardcode the old absolute path;
+    # let it be rebuilt under the new path further below.
+    rm -rf "$ADDON_DIR/.venv"
+
+    # Stray diagnostic / debug logs shouldn't migrate.
+    rm -f "$ADDON_DIR/markup-diag.log" "$ADDON_DIR/debug.log"
+
     # Rename config file if it exists
     if [ -f "$ADDON_DIR/autoswitch_config.json" ]; then
         mv "$ADDON_DIR/autoswitch_config.json" "$ADDON_DIR/polyglot_config.json"
