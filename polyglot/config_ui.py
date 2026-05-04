@@ -84,6 +84,7 @@ _SCRIPT_DISPLAY_NAMES = {
     "HANGUL": "Hangul (Korean)",
     "CJK": "CJK (Chinese/Japanese/Korean)",
     "IPA": "IPA (International Phonetic Alphabet)",
+    "BRAILLE": "Unicode Braille (dot patterns)",
 }
 
 # AT-SPI events to suppress during UI build/teardown
@@ -818,11 +819,23 @@ class PolyglotSettingsWindow(Gtk.Window):
 
         listbox = FocusManagedListBox(self.focus_sidebar)
 
-        row, self._enable_switch, _ = _create_switch_row(
-            "_Enable automatic language switching",
-            self._config.enabled,
-            atk_name="Enable automatic language switching")
-        listbox.add_row_with_widget(row, self._enable_switch)
+        row, self._detection_mode_combo, _ = _create_combo_row(
+            "_Language detection:",
+            atk_name="Language detection mode",
+            atk_desc=("Off: never switch language. Markup only: trust language "
+                      "tags from documents and Orca, plus deterministic "
+                      "Unicode-script detection. Markup + text: also run "
+                      "statistical detection on plain text. Always: ignore "
+                      "markup hints and force statistical detection."))
+        self._detection_mode_combo.append("off", "Off")
+        self._detection_mode_combo.append("markup_only", "Markup only")
+        self._detection_mode_combo.append("markup_text", "Markup + text")
+        self._detection_mode_combo.append("always", "Always (ignore markup)")
+        if not self._config.enabled:
+            self._detection_mode_combo.set_active_id("off")
+        else:
+            self._detection_mode_combo.set_active_id(self._config.detection_mode)
+        listbox.add_row_with_widget(row, self._detection_mode_combo)
 
         row, self._threshold_spin, _ = _create_spin_row(
             "_Words before switching:", 1, 10, 1,
@@ -927,6 +940,14 @@ class PolyglotSettingsWindow(Gtk.Window):
             atk_desc="Pause between language-switched segments (0 for no pause)")
         mixed_listbox.add_row_with_widget(row, self._pause_spin)
 
+        row, self._mixed_max_words_spin, _ = _create_spin_row(
+            "_Max words for mixed-language detection:", 50, 5000, 50,
+            value=self._config.mixed_max_words,
+            atk_name="Mixed-language word cap",
+            atk_desc="Above this many words, mixed-language detection is "
+                     "skipped so speech can start immediately. Default 600.")
+        mixed_listbox.add_row_with_widget(row, self._mixed_max_words_spin)
+
         page.pack_start(mixed_listbox, False, False, 0)
         return page
 
@@ -998,6 +1019,8 @@ class PolyglotSettingsWindow(Gtk.Window):
             lang_values = []
             if script_id == "IPA":
                 lang_values = [("ipa", "IPA braille only")]
+            elif script_id == "BRAILLE":
+                lang_values = [("unicode_braille", "Unicode braille only")]
             else:
                 for lc in available_langs:
                     display = _LANG_DISPLAY_NAMES.get(lc, lc)
@@ -1147,7 +1170,12 @@ class PolyglotSettingsWindow(Gtk.Window):
     def _save_config(self):
         """Save configuration from dialog state."""
         # General
-        self._config.enabled = self._enable_switch.get_active()
+        mode = self._detection_mode_combo.get_active_id() or "markup_text"
+        if mode == "off":
+            self._config.enabled = False
+        else:
+            self._config.enabled = True
+            self._config.detection_mode = mode
         self._config.word_threshold = int(self._threshold_spin.get_value())
         default_lang = self._default_combo.get_active_id()
         if default_lang:
@@ -1162,6 +1190,7 @@ class PolyglotSettingsWindow(Gtk.Window):
         self._config.switch_confidence = self._confidence_spin.get_value()
         self._config.enable_mixed_language = self._mixed_lang_switch.get_active()
         self._config.language_switch_pause = self._pause_spin.get_value()
+        self._config.mixed_max_words = int(self._mixed_max_words_spin.get_value())
 
         # Languages
         enabled = []

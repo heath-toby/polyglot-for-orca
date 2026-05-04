@@ -4,6 +4,12 @@ import unicodedata
 from collections import Counter
 from functools import lru_cache
 
+# Sentinel "language" codes — not real spoken languages, just trigger
+# braille-table switches. They live in script_to_language but never in
+# enabled_languages, so detect()/detect_character() must allow them
+# through without the enabled-languages check.
+_BRAILLE_ONLY_SENTINELS = ("ipa", "unicode_braille")
+
 _LINGUA_AVAILABLE = False
 try:
     from lingua import Language, LanguageDetectorBuilder
@@ -102,11 +108,14 @@ if _LINGUA_AVAILABLE:
 
 def _get_script(char):
     """Get the script of a single character."""
+    cp = ord(char)
+    # Braille Patterns are category So (symbol), not L/M/N — check first
+    if 0x2800 <= cp <= 0x28FF:
+        return "BRAILLE"
     cat = unicodedata.category(char)
     if cat.startswith(("L", "M", "N")):
         # IPA Extensions range — must check before name lookup since
         # IPA chars have names like "LATIN SMALL LETTER TURNED A"
-        cp = ord(char)
         if 0x0250 <= cp <= 0x02AF:
             return "IPA"
         try:
@@ -139,7 +148,13 @@ def detect_script(text):
         return None
 
     dominant, count = scripts.most_common(1)[0]
-    total_letters = sum(1 for c in text if unicodedata.category(c).startswith(("L", "M", "N")))
+    # Count letter/mark/number characters plus braille patterns (which are
+    # symbols, not letters) so a pure-braille line can register as dominant.
+    total_letters = sum(
+        1 for c in text
+        if unicodedata.category(c).startswith(("L", "M", "N"))
+        or 0x2800 <= ord(c) <= 0x28FF
+    )
     if total_letters > 0 and count / total_letters >= 0.5:
         return dominant
 
@@ -147,6 +162,22 @@ def detect_script(text):
 
 
 import re
+
+# Sentence boundary splitter for chunked mixed-language detection.
+# Splits on .!? followed by whitespace, and on newlines (which often
+# delimit list items, log lines, or code that has no sentence punctuation).
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+|\n+')
+
+# Above this many words, mixed detection runs per-sentence instead of one
+# big call. Lingua's multi-language detection on long text is slow enough
+# to block Orca's main thread; per-sentence calls each return quickly.
+_MIXED_CHUNK_THRESHOLD = 30
+
+# Hard ceiling for any single chunk passed to detect_multiple_languages_of.
+# If sentence splitting leaves a chunk longer than this (e.g., unpunctuated
+# prose), we fall back to a fixed word-count split so no individual call
+# can block the main thread.
+_MIXED_HARD_CHUNK_WORDS = 40
 
 # Tokens that look like paths, flags, URLs, variables — not real words
 _NOISE_PATTERN = re.compile(
@@ -196,11 +227,13 @@ class LanguageDetector:
     _SWITCH_AWAY_MIN_WORDS = 3
 
     def __init__(self, enabled_languages, word_threshold, script_to_language,
-                 default_language=None, switch_confidence=None):
+                 default_language=None, switch_confidence=None,
+                 mixed_max_words=600):
         self._enabled_languages = enabled_languages
         self._word_threshold = max(1, word_threshold)
         self._script_to_language = script_to_language
         self._default_language = default_language
+        self._mixed_max_words = max(8, mixed_max_words)
         self._current_language = None
         self._word_buffer = []
         self._lingua_detector = None
@@ -234,19 +267,41 @@ class LanguageDetector:
     def current_language(self, value):
         self._current_language = value
 
-    def detect(self, text):
-        """Detect language of text. Returns ISO 639-1 code or None."""
-        if not text or not text.strip():
-            return self._current_language
+    def detect(self, text, statistical=True, fallback_to_current=True):
+        """Detect language of text. Returns ISO 639-1 code or None.
 
-        # Tier 1: Script detection (fast path)
+        ``statistical=False`` skips the Lingua tier — useful in markup-only
+        mode where we still want deterministic Unicode-script detection
+        (Cyrillic, BRAILLE, IPA …) but no statistical guessing on Latin text.
+
+        ``fallback_to_current=False`` returns ``None`` when no positive
+        signal is found instead of echoing the previous language. Callers
+        that want to detect "no signal at all" (so they can reset to
+        default rather than stick on a stale language) should pass False.
+        """
+        if not text or not text.strip():
+            return self._current_language if fallback_to_current else None
+
+        # Tier 1: Script detection (fast path) — always runs.
+        # Braille-only sentinels (ipa, unicode_braille) aren't in
+        # enabled_languages but are valid signals — they just trigger a
+        # contraction-table switch in _switch_language without changing
+        # voice. Allow them through without the enabled check, and don't
+        # write _current_language for them (it stays whatever spoken
+        # language was active).
         script = detect_script(text)
         if script:
             lang = self._script_to_language.get(script)
-            if lang and lang in self._enabled_languages:
-                self._current_language = lang
-                self._word_buffer.clear()
+            if lang in _BRAILLE_ONLY_SENTINELS:
                 return lang
+            if lang and lang in self._enabled_languages:
+                if fallback_to_current:
+                    self._current_language = lang
+                    self._word_buffer.clear()
+                return lang
+
+        if not statistical:
+            return self._current_language if fallback_to_current else None
 
         # Tier 2: Lingua detection (slow path, Latin scripts)
         if self._lingua_detector:
@@ -313,20 +368,29 @@ class LanguageDetector:
             return lang_code, best.value
         return None, 0.0
 
-    def detect_character(self, char):
-        """Detect language for a single character (character-by-character navigation)."""
+    def detect_character(self, char, fallback_to_current=True):
+        """Detect language for a single character (character-by-character navigation).
+
+        ``fallback_to_current=False`` returns ``None`` when the character has
+        no positive script signal (Latin, punctuation, …) instead of echoing
+        the previous language. Used by markup-only mode so a char read after
+        a context switch doesn't keep the stale voice.
+        """
         if not char:
-            return self._current_language
+            return self._current_language if fallback_to_current else None
 
         script = _get_script(char)
         if script and script != "LATIN":
             lang = self._script_to_language.get(script)
+            if lang in _BRAILLE_ONLY_SENTINELS:
+                return lang
             if lang and lang in self._enabled_languages:
-                self._current_language = lang
+                if fallback_to_current:
+                    self._current_language = lang
                 return lang
 
-        # For Latin characters, keep current language context
-        return self._current_language
+        # No positive signal — Latin char, punctuation, etc.
+        return self._current_language if fallback_to_current else None
 
     def reset_buffer(self):
         """Reset the word buffer (e.g., when navigating to a new line)."""
@@ -337,6 +401,14 @@ class LanguageDetector:
 
         Returns a list of (text_segment, iso_code) tuples, or None if
         mixed detection is unavailable or the text is too short.
+
+        Strategy:
+          - Texts under ~30 words: single Lingua call (fast, current behaviour).
+          - Up to ``mixed_max_words``: split on sentence boundaries and run
+            detection per chunk. Each call is short, so no individual
+            detection blocks Orca's main thread for long.
+          - Beyond ``mixed_max_words``: skip mixed detection so speech can
+            start immediately. The single-language detector handles voice.
 
         Uses a separate high-accuracy detector (lazy-built on first call)
         with preloaded language models for better mixed-language splitting.
@@ -349,6 +421,10 @@ class LanguageDetector:
         if len(words) < 8:
             return None
 
+        # Above the user-configured cap, fall back to single-language detection
+        if len(words) > self._mixed_max_words:
+            return None
+
         # Lazy-build high-accuracy detector on first use
         if self._mixed_detector is None:
             if len(self._lingua_langs) < 2:
@@ -359,6 +435,9 @@ class LanguageDetector:
                 self._mixed_detector = builder.build()
             except Exception:
                 return None
+
+        if len(words) > _MIXED_CHUNK_THRESHOLD:
+            return self._detect_mixed_chunked(text)
 
         try:
             results = self._mixed_detector.detect_multiple_languages_of(text)
@@ -379,6 +458,54 @@ class LanguageDetector:
             pass
 
         return None
+
+    def _detect_mixed_chunked(self, text):
+        """Run mixed detection per sentence and concatenate the segments.
+
+        Sentence-split first; any chunk still longer than
+        ``_MIXED_HARD_CHUNK_WORDS`` (e.g., unpunctuated prose) is further
+        split by word count so no single Lingua call gets a long string.
+        """
+        all_segments = []
+
+        for chunk in self._iter_chunks(text):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                if len(chunk.split()) < 8:
+                    detected, _ = self._cached_lingua_detect_with_confidence(chunk)
+                    if detected:
+                        all_segments.append((chunk, detected))
+                    continue
+                results = self._mixed_detector.detect_multiple_languages_of(chunk)
+                if not results:
+                    continue
+                for r in results:
+                    seg_text = chunk[r.start_index:r.end_index]
+                    lang_code = _LINGUA_LANG_MAP.get(r.language)
+                    if lang_code and seg_text.strip():
+                        all_segments.append((seg_text, lang_code))
+            except Exception:
+                continue
+
+        if len(set(code for _, code in all_segments)) >= 2:
+            return all_segments
+        return None
+
+    def _iter_chunks(self, text):
+        """Yield text chunks, each at most _MIXED_HARD_CHUNK_WORDS words.
+
+        First splits on sentence boundaries. Any sentence that's still too
+        long is further split into fixed-size word groups.
+        """
+        for sentence in _SENTENCE_SPLIT.split(text):
+            words = sentence.split()
+            if len(words) <= _MIXED_HARD_CHUNK_WORDS:
+                yield sentence
+                continue
+            for i in range(0, len(words), _MIXED_HARD_CHUNK_WORDS):
+                yield " ".join(words[i:i + _MIXED_HARD_CHUNK_WORDS])
 
 
 def is_lingua_available():

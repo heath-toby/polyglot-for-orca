@@ -235,28 +235,21 @@ class VoiceMapper:
         """Extract rate/pitch/gain from the default Orca profile or general section.
 
         These serve as the baseline for languages that don't have their own profile.
-        Checks 'profiles.default' first, falls back to 'general'.
+        Checks ``profiles.default`` first, falls back to ``general``. Each
+        field is resolved independently — a profile that only sets ``rate``
+        won't shadow ``general``'s pitch/gain.
         """
-        for section_key in ("profiles", "general"):
-            if section_key == "profiles":
-                section = data.get("profiles", {}).get("default", {})
-            else:
-                section = data.get("general", {})
-
-            voices = section.get("voices", {})
-            default_voice = voices.get("default", {})
-
-            rate = default_voice.get("rate")
-            if rate is not None:
-                self._default_profile_settings["rate"] = rate
-                pitch = default_voice.get("average-pitch")
-                if pitch is not None:
-                    self._default_profile_settings["average-pitch"] = pitch
-                gain = default_voice.get("gain")
-                if gain is not None:
-                    self._default_profile_settings["gain"] = gain
-                # Found settings in this section, no need to check the next
-                return
+        sections = (
+            data.get("profiles", {}).get("default", {}),
+            data.get("general", {}),
+        )
+        for field in ("rate", "average-pitch", "gain"):
+            for section in sections:
+                voice = section.get("voices", {}).get("default", {})
+                value = voice.get(field)
+                if value is not None:
+                    self._default_profile_settings[field] = value
+                    break
 
     def get_default_profile_settings(self):
         """Return the default profile's voice settings (rate, pitch, gain).

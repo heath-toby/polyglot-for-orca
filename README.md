@@ -90,7 +90,7 @@ Once installed, Polyglot works automatically. Navigate text as usual -- when the
 
 Press **Orca+Shift+L** to open the settings dialog. From here you can:
 
-- Enable or disable auto language switching
+- Choose a language detection mode (Off, Markup only, Markup + text, Always — see below)
 - Enable or disable Unicode character reading including emojis (independent of language switching)
 - Enable or disable mixed-language detection (speech only; braille always uses whole-line detection)
 - Choose which languages are active
@@ -99,6 +99,17 @@ Press **Orca+Shift+L** to open the settings dialog. From here you can:
 - Set contraction tables per language (for contracted braille)
 - Map Unicode scripts to languages (e.g. Cyrillic to Russian)
 - Set the word threshold (how many words before switching)
+
+### Detection modes
+
+Polyglot has four detection modes:
+
+- **Off** — never switch language. Emoji and Unicode-character reading still work.
+- **Markup only** — trust language tags from documents and Orca (which include AT-SPI and Orca 50's own markup-aware detection), plus deterministic Unicode-script detection for non-Latin scripts (Cyrillic, Arabic, BRAILLE, IPA, …). Skip statistical detection — short technical text never gets misclassified.
+- **Markup + text** *(default)* — same as Markup only, plus Lingua statistical detection on plain Latin-script text. This is the previous behaviour and what most users want.
+- **Always (ignore markup)** — never trust language tags from upstream; always run our own full detection. Useful when document `lang` attributes are stale or unreliable.
+
+Mixed-language splitting and the word threshold only apply in the two modes that run statistical detection (Markup + text and Always).
 
 ### Debug logging
 
@@ -128,7 +139,6 @@ Polyglot monkey-patches several Orca functions at startup:
 - `speech_generator.SpeechGenerator.voice` -- provides language-aware voice selection with uppercase/hyperlink voice-type overlay
 - `speech_presenter.adjust_for_presentation` -- expands unpronounceable Unicode characters (box drawings, arrows, etc.) before Orca's repeat handler, so repeated characters get proper descriptions
 - `default.Script.update_braille` -- detects language before building braille regions and sets the correct contraction table
-- `braille.refresh` -- detects language from braille line content during panning
 
 Language detection uses two tiers:
 1. **Unicode script detection** (fast) -- identifies non-Latin scripts (Cyrillic, Arabic, etc.) by examining character names. This is instant and needs only a few characters.

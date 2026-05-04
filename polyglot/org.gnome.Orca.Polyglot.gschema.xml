@@ -45,9 +45,21 @@
       <default>0.3</default>
       <summary>Pause duration between language switches in seconds</summary>
     </key>
+    <key name="mixed-max-words" type="i">
+      <default>600</default>
+      <summary>Word cap above which mixed-language detection is skipped</summary>
+    </key>
+    <key name="detection-mode" type="s">
+      <default>'markup_text'</default>
+      <summary>Language detection mode: off, markup_only, markup_text, or always</summary>
+    </key>
     <key name="ignored-apps" type="as">
       <default>[]</default>
       <summary>Applications excluded from language detection</summary>
+    </key>
+    <key name="is-configured" type="b">
+      <default>false</default>
+      <summary>Set to true after the first save so is_first_run can tell deliberate clears from fresh installs</summary>
     </key>
   </schema>
   <schema id="org.gnome.Orca.Polyglot.Language">

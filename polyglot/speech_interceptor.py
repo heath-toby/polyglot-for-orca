@@ -40,6 +40,48 @@ _emoji_available = False
 _emoji_languages = set()
 
 
+def _normalize_lang_code(lang):
+    """Reduce a language tag from any common form to a bare ISO 639-1 code.
+
+    Handles BCP 47 (``de``, ``de-DE``, ``en-Latn-US``), POSIX locales
+    (``de_DE``, ``de_DE.UTF-8``, ``de@variant``), and stray uppercase
+    casing. Returns the lowercased primary subtag, or ``None`` if the
+    input is empty.
+    """
+    if not lang or not isinstance(lang, str):
+        return None
+    code = lang.strip()
+    if not code:
+        return None
+    for sep in ("-", "_", ".", "@"):
+        if sep in code:
+            code = code.split(sep, 1)[0]
+    code = code.lower()
+    return code or None
+
+
+def _acss_lang(acss):
+    """Read the language tag from an ACSS family, normalised to ISO 639-1.
+
+    Returns ``None`` if there's no usable language signal. Treats this as
+    "voice() told us the language explicitly upstream" — the markup-only
+    rule is: explicit signal here → use it, otherwise default.
+    """
+    if acss is None:
+        return None
+    try:
+        from orca.acss import ACSS
+        family = acss.get(ACSS.FAMILY)
+        if not family:
+            return None
+        if isinstance(family, dict):
+            return _normalize_lang_code(family.get("lang"))
+        # VoiceFamily — also dict-like
+        return _normalize_lang_code(family.get("lang"))
+    except Exception:
+        return None
+
+
 def _init_emoji():
     """Try to import emoji module. Called after _add_venv_to_path()."""
     global _emoji_mod, _emoji_available, _emoji_languages
@@ -728,6 +770,7 @@ def install():
         script_to_language=_config.script_to_language,
         default_language=_config.default_language,
         switch_confidence=_config.switch_confidence,
+        mixed_max_words=_config.mixed_max_words,
     )
     _current_language = _config.default_language
     _detector.current_language = _current_language
@@ -809,6 +852,14 @@ def _switch_language(lang_code):
         _set_contraction_table("/usr/share/liblouis/tables/IPA.utb")
         return
 
+    # Unicode braille sentinel — line is made of U+2800–U+28FF dot patterns.
+    # Use the liblouis pass-through table so contracted braille shows the
+    # actual dot patterns instead of being misinterpreted. Keep voice and
+    # current language unchanged so speech still tracks the surrounding text.
+    if lang_code == "unicode_braille":
+        _set_contraction_table("/usr/share/liblouis/tables/unicode-braille.utb")
+        return
+
     if lang_code == _current_language:
         return
 
@@ -818,20 +869,62 @@ def _switch_language(lang_code):
     if _in_detection:
         # Avoid reentrancy — just update the language marker
         _current_language = lang_code
+        if _detector is not None:
+            _detector.current_language = lang_code
         return
 
     _in_detection = True
     try:
         _debug(f"_switch_language: {_current_language} -> {lang_code}")
         _current_language = lang_code
+        # Keep the detector's notion of "current language" in sync. Without
+        # this, markup-only mode silently misbehaves: _patched_voice sets
+        # this module's _current_language from markup, but the detector
+        # still holds the previous value. _patched_speak then calls
+        # detect(statistical=False) which falls back to the detector's
+        # stale value and overrides the just-resolved ACSS with the wrong
+        # language — symptom: German markup reads in English.
+        if _detector is not None:
+            _detector.current_language = lang_code
         lang_settings = _config.language_settings.get(lang_code, {})
         _switch_braille_tables(lang_settings)
+        _set_orca_names_locale(lang_code)
         _debug(f"_switch_language: done")
     except Exception as e:
         _debug(f"_switch_language: ERROR {e}")
         raise
     finally:
         _in_detection = False
+
+
+_current_names_locale = None
+
+
+def _set_orca_names_locale(lang_code):
+    """Switch Orca's character/symbol name modules to ``lang_code``.
+
+    Orca's mathsymbols, keynames, cmdnames etc. read translations through
+    gettext. ``orca_i18n.setLocaleForNames`` reloads those modules against
+    a different locale, which makes character announcements (space, comma,
+    arrows, …) come out in that language. Driving it from our language
+    switch means symbol names follow the active language too — useful as
+    an audible signal that the language really changed.
+
+    Cached so we only pay the reload cost on actual locale changes. Skip
+    for braille-only sentinels.
+    """
+    global _current_names_locale
+    if not lang_code or lang_code in ("ipa", "unicode_braille"):
+        return
+    if lang_code == _current_names_locale:
+        return
+    try:
+        from orca import orca_i18n
+        orca_i18n.setLocaleForNames(lang_code)
+        _current_names_locale = lang_code
+        _debug(f"setLocaleForNames: {lang_code}")
+    except Exception as e:
+        _debug(f"setLocaleForNames ERROR: {e}")
 
 
 _current_contraction_table = None
@@ -873,10 +966,13 @@ def _set_contraction_table(table_path):
     except Exception as e:
         _debug(f"_set_contraction_table: orca ERROR {e}")
 
-    # Also switch BrlTTY text table to match
+    # Also switch BrlTTY text table to match. Skip for braille-only tables
+    # (IPA, unicode-braille) — those don't correspond to a spoken language,
+    # and BRLTTY already renders Braille Pattern characters by their dots
+    # regardless of which text table is active.
     import os
     table_name = os.path.splitext(os.path.basename(table_path))[0]
-    if "IPA" in table_name:
+    if "IPA" in table_name or table_name.startswith("unicode-braille"):
         return
     lang_code = table_name.split("-")[0]
     _set_brltty_text_table(lang_code)
@@ -982,25 +1078,59 @@ def _apply_patches():
             return False
 
     def _patched_speak(text, acss=None):
-        # Language detection and voice switching
+        # Language detection and voice switching. _patched_speak has no
+        # markup signal of its own; the upstream voice() patch already
+        # applied the markup language (if any) to the ACSS. Here we run
+        # our own text-based detection only when the mode allows it.
         try:
-            if _config.enabled and _detector and text and isinstance(text, str) and not _is_app_ignored():
-                detected = _detector.detect(text)
-                _debug(f"_speak: text={text[:40]!r} detected={detected}")
-                if detected:
-                    _switch_language(detected)
-                    lang_acss = _get_lang_acss(detected)
-                    if lang_acss:
-                        acss = lang_acss
+            if (_config.enabled and _detector and text
+                    and isinstance(text, str) and not _is_app_ignored()
+                    and _config.detection_mode != "off"):
+                mode = _config.detection_mode
+                if mode == "markup_only":
+                    # Strict rule: explicit signal → that language;
+                    # otherwise default. The signal is either (a) the
+                    # ACSS family.lang voice() resolved upstream, or
+                    # (b) a non-Latin script in the text itself.
+                    # Only overwrite the caller's acss when there is no
+                    # acss to begin with — same policy as
+                    # _patched_speak_character. Preserves any
+                    # uppercase/hyperlink overrides voice() merged in.
+                    explicit = _acss_lang(acss)
+                    if explicit not in _lang_acss_cache:
+                        explicit = None
+                    if not explicit:
+                        explicit = _detector.detect(
+                            text, statistical=False, fallback_to_current=False)
+                    if not explicit:
+                        explicit = _config.default_language
+                    _debug(f"_speak: text={text[:40]!r} explicit={explicit}")
+                    _switch_language(explicit)
+                    if acss is None:
+                        lang_acss = _get_lang_acss(explicit)
+                        if lang_acss:
+                            acss = lang_acss
+                else:
+                    statistical = mode in ("markup_text", "always")
+                    detected = _detector.detect(text, statistical=statistical)
+                    _debug(f"_speak: text={text[:40]!r} detected={detected}")
+                    if detected:
+                        _switch_language(detected)
+                        lang_acss = _get_lang_acss(detected)
+                        if lang_acss:
+                            acss = lang_acss
         except Exception as e:
             _debug(f"_speak lang: ERROR {e}")
 
         # Mixed-language splitting — speech only, braille ignores this.
         # Only one braille table can be active at a time, so braille stays
-        # on the whole-line language detected by update_braille.
+        # on the whole-line language detected by update_braille. Mixed
+        # splitting is Lingua-driven, so it only runs in modes that allow
+        # statistical detection.
         try:
             if (_config.enabled and _config.enable_mixed_language and _detector
-                    and text and isinstance(text, str) and not _is_app_ignored()):
+                    and text and isinstance(text, str) and not _is_app_ignored()
+                    and _config.detection_mode in ("markup_text", "always")):
                 segments = _detector.detect_mixed(text)
                 if segments:
                     _debug(f"_speak mixed: {len(segments)} segments")
@@ -1074,21 +1204,41 @@ def _apply_patches():
     _original_speak_character = speech.speak_character
 
     def _patched_speak_character(character, acss=None, cap_style=None):
-        # Language detection for character navigation.
-        # Only switch braille tables here — the caller already obtained
-        # the correct voice ACSS (with uppercase pitch etc.) from
-        # _patched_voice, so we must not overwrite it.  Fall back to
-        # lang_acss only when no voice was provided at all.
+        # Language resolution for character navigation. Same strict rule
+        # as _patched_speak in markup-only mode: explicit signal → that
+        # language, otherwise default. The signal is acss.family.lang
+        # (which voice() resolved upstream from markup or obj-locale) or
+        # a non-Latin script in the character itself. Punctuation and
+        # plain Latin chars carry no signal — they go to default voice.
         try:
-            if _config.enabled and _detector and character and isinstance(character, str) and not _is_app_ignored():
-                detected = _detector.detect_character(character)
-                _debug(f"speak_char: char={character!r} detected={detected}")
-                if detected:
-                    _switch_language(detected)
+            if (_config.enabled and _detector and character
+                    and isinstance(character, str) and not _is_app_ignored()
+                    and _config.detection_mode != "off"):
+                mode = _config.detection_mode
+                if mode == "markup_only":
+                    explicit = _acss_lang(acss)
+                    if explicit not in _lang_acss_cache:
+                        explicit = None
+                    if not explicit:
+                        explicit = _detector.detect_character(
+                            character, fallback_to_current=False)
+                    if not explicit:
+                        explicit = _config.default_language
+                    _debug(f"speak_char: char={character!r} explicit={explicit}")
+                    _switch_language(explicit)
                     if acss is None:
-                        lang_acss = _get_lang_acss(detected)
+                        lang_acss = _get_lang_acss(explicit)
                         if lang_acss:
                             acss = lang_acss
+                else:
+                    detected = _detector.detect_character(character)
+                    _debug(f"speak_char: char={character!r} detected={detected}")
+                    if detected:
+                        _switch_language(detected)
+                        if acss is None:
+                            lang_acss = _get_lang_acss(detected)
+                            if lang_acss:
+                                acss = lang_acss
         except Exception as e:
             _debug(f"speak_char lang: ERROR {e}")
 
@@ -1130,7 +1280,7 @@ def _apply_patches():
     _original_say_all = speech.say_all
 
     def _patched_say_all(utterance_iterator, progress_callback):
-        if _config.speak_emojis and _emoji_available:
+        if _config and _config.speak_emojis and _emoji_available:
             def _emoji_iterator(iterator):
                 for context, acss in iterator:
                     try:
@@ -1154,12 +1304,52 @@ def _apply_patches():
 
         def _patched_voice(self, key=None, **args):
             try:
-                if _config.enabled and not _is_app_ignored():
-                    language = args.get("language")
+                mode = _config.detection_mode if _config else "markup_text"
+                if (_config.enabled and _detector and not _is_app_ignored()
+                        and mode != "off"):
+                    # "always" mode forces our own detection — ignore the
+                    # markup language Orca passed in (some sources of
+                    # markup are unreliable). All other modes prefer the
+                    # markup hint when present. Normalize whatever we got
+                    # so "de_DE", "de-DE", "DE" all collapse to "de".
+                    raw_lang = args.get("language")
+                    language = (
+                        None if mode == "always"
+                        else _normalize_lang_code(raw_lang)
+                    )
+
+                    # Fall back to the object's reported locale. Mirrors
+                    # Orca's _resolve_language_and_dialect. Required for
+                    # paragraph/phrase reads (Ctrl+Up/Down): generate_phrase
+                    # calls voice() with obj+string but no language arg, so
+                    # without this we'd never see the markup.
+                    if not language and mode != "always":
+                        obj = args.get("obj")
+                        if obj is not None:
+                            try:
+                                from orca.ax_object import AXObject
+                                language = _normalize_lang_code(
+                                    AXObject.get_locale(obj))
+                            except Exception:
+                                pass
+
                     string = args.get("string", "")
-                    if not language:
-                        if isinstance(string, str) and string.strip():
-                            language = _detector.detect(string)
+                    if not language and isinstance(string, str) and string.strip():
+                        if mode == "markup_only":
+                            # Tier 1 (script) only — never fall back to
+                            # the previous language. If no script signal
+                            # either, reset to default. Without the reset,
+                            # voice would stick on the last detected
+                            # language across context changes.
+                            language = _detector.detect(
+                                string, statistical=False,
+                                fallback_to_current=False)
+                            if not language:
+                                language = _config.default_language
+                        else:
+                            statistical = mode in ("markup_text", "always")
+                            language = _detector.detect(
+                                string, statistical=statistical)
                     if language:
                         _switch_language(language)
                         lang_acss = _get_lang_acss(language)
@@ -1233,7 +1423,9 @@ def _apply_patches():
         def _patched_update_braille(self, obj, **args):
             _debug(f"update_braille: ENTER")
             try:
-                if _config.enabled and _detector and obj is not None and not _is_app_ignored():
+                mode = _config.detection_mode if _config else "markup_text"
+                if (_config.enabled and _detector and obj is not None
+                        and not _is_app_ignored() and mode != "off"):
                     from orca.ax_text import AXText
                     offset = args.get("offset")
                     if offset is None:
@@ -1242,7 +1434,26 @@ def _apply_patches():
                     if line and line[0]:
                         text = line[0]
                         if isinstance(text, str) and text.strip():
-                            detected = _detector.detect(text)
+                            detected = None
+                            # Prefer obj-locale (markup signal) in non-always modes
+                            if mode != "always":
+                                try:
+                                    from orca.ax_object import AXObject
+                                    detected = _normalize_lang_code(
+                                        AXObject.get_locale(obj))
+                                except Exception:
+                                    pass
+                            if not detected:
+                                if mode == "markup_only":
+                                    detected = _detector.detect(
+                                        text, statistical=False,
+                                        fallback_to_current=False)
+                                    if not detected:
+                                        detected = _config.default_language
+                                else:
+                                    statistical = mode in ("markup_text", "always")
+                                    detected = _detector.detect(
+                                        text, statistical=statistical)
                             if detected:
                                 _debug(f"update_braille: detected={detected}")
                                 _switch_language(detected)
@@ -1260,35 +1471,6 @@ def _apply_patches():
         DefaultScript.update_braille = _patched_update_braille
     except Exception as e:
         log.warning(f"Polyglot: could not patch update_braille: {e}")
-
-
-
-def _patch_braille_refresh():
-    """Patch braille.refresh so panning through braille content triggers language detection."""
-    from orca import braille
-
-    _original_refresh = braille.refresh
-
-    def _patched_refresh(pan_to_cursor=True, target_cursor_cell=0, indicate_links=True, stop_flash=True):
-        if _config.enabled and _detector:
-            try:
-                text_parts = []
-                for line in braille._STATE.lines:
-                    for region in line.regions:
-                        raw = getattr(region, '_raw_line', '') or getattr(region, 'string', '')
-                        if raw and raw.strip():
-                            text_parts.append(raw)
-                if text_parts:
-                    combined = " ".join(text_parts)
-                    detected = _detector.detect(combined)
-                    if detected:
-                        _switch_language(detected)
-            except Exception:
-                pass
-
-        return _original_refresh(pan_to_cursor, target_cursor_cell, indicate_links, stop_flash)
-
-    braille.refresh = _patched_refresh
 
 
 # --- Keybinding registration ---
@@ -1400,6 +1582,7 @@ def reload_config():
         script_to_language=_config.script_to_language,
         default_language=_config.default_language,
         switch_confidence=_config.switch_confidence,
+        mixed_max_words=_config.mixed_max_words,
     )
     _current_language = _config.default_language
     _detector.current_language = _current_language

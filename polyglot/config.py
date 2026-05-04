@@ -35,7 +35,13 @@ _DEFAULT_SCRIPT_TO_LANGUAGE = {
     "HANGUL": "ko",
     "CJK": "zh",
     "IPA": "ipa",
+    "BRAILLE": "unicode_braille",
 }
+
+# Sentinel "language" codes that don't correspond to a real voice — they
+# only switch the braille contraction table. Treated specially in sync
+# so they aren't pruned for not having a voice.
+_BRAILLE_ONLY_SENTINELS = ("ipa", "unicode_braille")
 
 _DEFAULTS = {
     "enabled": True,
@@ -50,8 +56,19 @@ _DEFAULTS = {
     "speak_emoticons": True,
     "enable_mixed_language": False,
     "language_switch_pause": 0.3,
+    "mixed_max_words": 600,
+    # off | markup_only | markup_text | always.
+    # markup_text preserves prior behaviour: trust Orca's language hints
+    # (markup, AT-SPI, Orca's own detector) when present, else fall back
+    # to our full detection.
+    "detection_mode": "markup_text",
     "ignored_apps": [],
 }
+
+# Modes in which we run Lingua statistical detection on plain text.
+# In "off" we run nothing; in "markup_only" we still run the deterministic
+# script tier (Cyrillic, BRAILLE, IPA, …) but never Lingua.
+_STATISTICAL_MODES = ("markup_text", "always")
 
 # --- GSettings helpers ---
 
@@ -140,6 +157,8 @@ class Config:
         self.speak_emoticons = _DEFAULTS["speak_emoticons"]
         self.enable_mixed_language = _DEFAULTS["enable_mixed_language"]
         self.language_switch_pause = _DEFAULTS["language_switch_pause"]
+        self.mixed_max_words = _DEFAULTS["mixed_max_words"]
+        self.detection_mode = _DEFAULTS["detection_mode"]
         self.ignored_apps = list(_DEFAULTS["ignored_apps"])
 
     def load(self):
@@ -185,13 +204,29 @@ class Config:
             self.unicode_verbosity = settings.get_string("unicode-verbosity")
             self.default_language = settings.get_string("default-language")
             self.enabled_languages = enabled
-            self.script_to_language = _variant_to_dict(
+            # Don't clobber the constructor's default mapping if the
+            # GSettings store has the schema empty default — that just
+            # means nothing's been saved here yet, not that the user
+            # cleared every script binding.
+            stored_script_map = _variant_to_dict(
                 settings.get_value("script-to-language")
             )
+            if stored_script_map:
+                self.script_to_language = stored_script_map
             self.switch_confidence = settings.get_double("switch-confidence")
             self.speak_emoticons = settings.get_boolean("speak-emoticons")
             self.enable_mixed_language = settings.get_boolean("enable-mixed-language")
             self.language_switch_pause = settings.get_double("language-switch-pause")
+            try:
+                self.mixed_max_words = settings.get_int("mixed-max-words")
+            except Exception:
+                self.mixed_max_words = _DEFAULTS["mixed_max_words"]
+            try:
+                mode = settings.get_string("detection-mode")
+                if mode in ("off", "markup_only", "markup_text", "always"):
+                    self.detection_mode = mode
+            except Exception:
+                pass
             self.ignored_apps = list(settings.get_strv("ignored-apps"))
 
             # Load per-language settings from relocatable schemas
@@ -234,7 +269,21 @@ class Config:
             settings.set_boolean("speak-emoticons", self.speak_emoticons)
             settings.set_boolean("enable-mixed-language", self.enable_mixed_language)
             settings.set_double("language-switch-pause", self.language_switch_pause)
+            try:
+                settings.set_int("mixed-max-words", int(self.mixed_max_words))
+            except Exception:
+                pass
+            try:
+                settings.set_string("detection-mode", self.detection_mode)
+            except Exception:
+                pass
             settings.set_strv("ignored-apps", self.ignored_apps)
+            # Mark as configured so is_first_run can distinguish "user has
+            # cleared all languages" from "fresh install".
+            try:
+                settings.set_boolean("is-configured", True)
+            except Exception:
+                pass
 
             for lang_code, lang_data in self.language_settings.items():
                 path = f"{_LANG_PATH_PREFIX}{lang_code}/"
@@ -295,6 +344,10 @@ class Config:
             self.speak_emoticons = data.get("speak_emoticons", self.speak_emoticons)
             self.enable_mixed_language = data.get("enable_mixed_language", self.enable_mixed_language)
             self.language_switch_pause = data.get("language_switch_pause", self.language_switch_pause)
+            self.mixed_max_words = data.get("mixed_max_words", self.mixed_max_words)
+            mode = data.get("detection_mode", self.detection_mode)
+            if mode in ("off", "markup_only", "markup_text", "always"):
+                self.detection_mode = mode
             self.ignored_apps = data.get("ignored_apps", self.ignored_apps)
 
             # Migrate old format: language_to_profile -> language_settings
@@ -321,6 +374,8 @@ class Config:
             "speak_emoticons": self.speak_emoticons,
             "enable_mixed_language": self.enable_mixed_language,
             "language_switch_pause": self.language_switch_pause,
+            "mixed_max_words": self.mixed_max_words,
+            "detection_mode": self.detection_mode,
             "ignored_apps": self.ignored_apps,
         }
         with open(self._path, "w") as f:
@@ -341,7 +396,7 @@ class Config:
                         "voice_dialect": family.get("dialect", ""),
                         "rate": voice_config.get("rate", 50.0),
                         "average_pitch": voice_config.get("average-pitch", 5.0),
-                        "braille_table": voice_config.get("brailleContractionTable", ""),
+                        "contraction_table": voice_config.get("brailleContractionTable", ""),
                     }
         except Exception:
             pass
@@ -394,11 +449,11 @@ class Config:
                     "rate": voice_config.get("rate", fallback_rate),
                     "average_pitch": voice_config.get("average-pitch", fallback_pitch),
                     "gain": default_gain,
-                    "braille_table": voice_config.get("brailleContractionTable", ""),
+                    "contraction_table": voice_config.get("brailleContractionTable", ""),
                 }
 
         for script, default_lang in _DEFAULT_SCRIPT_TO_LANGUAGE.items():
-            if default_lang in self.enabled_languages:
+            if default_lang in _BRAILLE_ONLY_SENTINELS or default_lang in self.enabled_languages:
                 self.script_to_language[script] = default_lang
 
     def sync_from_voices(self, voice_mapper):
@@ -407,7 +462,7 @@ class Config:
         - Checks that configured voices still exist; replaces with alternatives
         - Removes languages that have no voices available at all
         - Does NOT auto-add new languages (user enables those via settings)
-        - Preserves user-set fields like contraction_table and braille_table
+        - Preserves user-set fields like contraction_table
         Returns True if anything changed.
         """
         available = set(voice_mapper.get_available_languages())
@@ -446,7 +501,7 @@ class Config:
 
         # Remove stale script_to_language entries
         for script, lang in list(self.script_to_language.items()):
-            if lang not in self.enabled_languages and lang != "ipa":
+            if lang not in self.enabled_languages and lang not in _BRAILLE_ONLY_SENTINELS:
                 del self.script_to_language[script]
                 changed = True
 
@@ -459,7 +514,7 @@ class Config:
         # Add script_to_language entries for newly enabled languages
         for script, default_lang in _DEFAULT_SCRIPT_TO_LANGUAGE.items():
             if script not in self.script_to_language:
-                if default_lang == "ipa" or default_lang in self.enabled_languages:
+                if default_lang in _BRAILLE_ONLY_SENTINELS or default_lang in self.enabled_languages:
                     self.script_to_language[script] = default_lang
                     changed = True
 
@@ -467,12 +522,23 @@ class Config:
 
     @property
     def is_first_run(self):
-        """True if neither GSettings data nor JSON config exists."""
+        """True if neither GSettings data nor JSON config exists.
+
+        Uses the ``is-configured`` sentinel as the primary signal so that a
+        user who deliberately clears every language is not treated as a
+        first-run user on next start. Falls back to checking for any
+        enabled-languages or a JSON config file for older installs that
+        were saved before the sentinel existed.
+        """
         if _init_gsettings():
             try:
                 settings = _get_settings(_SCHEMA_ID, _SCHEMA_PATH)
-                enabled = settings.get_strv("enabled-languages")
-                if enabled:
+                try:
+                    if settings.get_boolean("is-configured"):
+                        return False
+                except Exception:
+                    pass
+                if settings.get_strv("enabled-languages"):
                     return False
             except Exception:
                 pass
