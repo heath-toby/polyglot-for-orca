@@ -217,6 +217,21 @@ else
     info "Created orca-customizations.py with loader."
 fi
 
+# Earlier installer versions removed the autoswitch loader block via sed,
+# which also removed an `import logging as _logging` line that some other
+# plugin loaders silently relied on. If we just edited the file and there
+# is no top-level `import logging`, prepend one defensively so blocks that
+# reference _logging in their except handlers don't NameError on failure.
+if [ -f "$CUSTOMIZATIONS" ] \
+        && ! grep -qE '^[[:space:]]*import[[:space:]]+logging' "$CUSTOMIZATIONS" \
+        && grep -q '_logging' "$CUSTOMIZATIONS"; then
+    info "Adding defensive 'import logging as _logging' at top..."
+    tmp=$(mktemp)
+    printf 'import logging as _logging\n\n' > "$tmp"
+    cat "$CUSTOMIZATIONS" >> "$tmp"
+    mv "$tmp" "$CUSTOMIZATIONS"
+fi
+
 # --- Install lingua (language detection library) ---
 
 info "Setting up language detection library..."
