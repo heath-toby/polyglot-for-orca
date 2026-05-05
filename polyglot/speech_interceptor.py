@@ -843,13 +843,24 @@ def _rebuild_acss_cache():
         log.info(f"Polyglot: cached ACSS for {lang_code}: {voice_name} rate={rate} pitch={pitch} gain={gain}")
 
 
-def _switch_language(lang_code):
-    """Switch voice and braille table for the detected language."""
+def _switch_language(lang_code, also_braille: bool = True):
+    """Switch voice (and optionally braille tables) for the detected language.
+
+    ``also_braille`` controls whether the contraction + BRLTTY text tables
+    are switched as a side effect. ``_patched_update_braille`` is the
+    canonical authority for braille — speech-side patches (``_patched_voice``,
+    ``_patched_speak``, ``_patched_speak_character``) pass ``False`` so that
+    a transient speech-time language switch (e.g. an English notification
+    arriving while a German line is focused) doesn't perturb the focus
+    line's braille tables. Symbol-name locale is treated as speech-side
+    state and switches regardless — it follows the active speech.
+    """
     global _current_language, _in_detection
 
     # IPA sentinel — switch braille table only, don't change voice or current language
     if lang_code == "ipa":
-        _set_contraction_table("/usr/share/liblouis/tables/IPA.utb")
+        if also_braille:
+            _set_contraction_table("/usr/share/liblouis/tables/IPA.utb")
         return
 
     # Unicode braille sentinel — line is made of U+2800–U+28FF dot patterns.
@@ -857,7 +868,8 @@ def _switch_language(lang_code):
     # actual dot patterns instead of being misinterpreted. Keep voice and
     # current language unchanged so speech still tracks the surrounding text.
     if lang_code == "unicode_braille":
-        _set_contraction_table("/usr/share/liblouis/tables/unicode-braille.utb")
+        if also_braille:
+            _set_contraction_table("/usr/share/liblouis/tables/unicode-braille.utb")
         return
 
     if lang_code == _current_language:
@@ -875,7 +887,7 @@ def _switch_language(lang_code):
 
     _in_detection = True
     try:
-        _debug(f"_switch_language: {_current_language} -> {lang_code}")
+        _debug(f"_switch_language: {_current_language} -> {lang_code} (also_braille={also_braille})")
         _current_language = lang_code
         # Keep the detector's notion of "current language" in sync. Without
         # this, markup-only mode silently misbehaves: _patched_voice sets
@@ -886,9 +898,12 @@ def _switch_language(lang_code):
         # language — symptom: German markup reads in English.
         if _detector is not None:
             _detector.current_language = lang_code
-        lang_settings = _config.language_settings.get(lang_code, {})
-        _switch_braille_tables(lang_settings)
+        # Symbol-name locale is speech-side: it follows whichever language
+        # is currently being spoken, regardless of braille state.
         _set_orca_names_locale(lang_code)
+        if also_braille:
+            lang_settings = _config.language_settings.get(lang_code, {})
+            _switch_braille_tables(lang_settings)
         _debug(f"_switch_language: done")
     except Exception as e:
         _debug(f"_switch_language: ERROR {e}")
@@ -932,13 +947,17 @@ _brltty_conn = None
 _brltty_failed = False
 _current_brltty_text_table = None
 
-# Saved braille-table state for the duration of a flash message
-# (notifications, time announcements, mode strings). Set when
-# display_message fires, restored when _flash_callback or kill_flash
-# restores the underlying line. None means "not currently inside a
-# flash" — distinguishable from an empty string ("no table set").
+# Saved state captured when entering a flash message (notifications,
+# time announcements, mode strings) and restored when the flash ends.
+# We track an explicit _in_flash flag rather than relying on None
+# sentinels because the saved values themselves may legitimately be
+# None (e.g. before any line has been focused, no contraction table
+# is set yet — "saving" None is a legitimate "no-op on restore").
+_in_flash = False
 _pre_flash_contraction_table: str | None = None
 _pre_flash_brltty_text_table: str | None = None
+_pre_flash_current_language: str | None = None
+_pre_flash_names_locale: str | None = None
 
 
 def _switch_to_default_braille_tables() -> None:
@@ -953,36 +972,60 @@ def _switch_to_default_braille_tables() -> None:
     default_lang = _config.default_language
     lang_settings = _config.language_settings.get(default_lang, {})
     contraction = lang_settings.get("contraction_table", "")
+    # Switch both tables together, or switch neither: a half-switched
+    # state where one table is the default-language and the other is
+    # still the focus line's language produces wrong braille (text and
+    # contraction tables disagreeing on character → dot mapping).
     if contraction:
         _set_contraction_table(contraction)
-    # _set_contraction_table already drives BRLTTY text table for
-    # language-named tables. If the default language's contraction
-    # table doesn't match the language-prefix convention, fall back
-    # to setting the BRLTTY text table directly.
-    _set_brltty_text_table(default_lang)
+        _set_brltty_text_table(default_lang)
 
 
 def _save_pre_flash_state() -> None:
-    """Snapshot the active braille tables before entering a flash."""
+    """Snapshot the active state before entering a flash."""
+    global _in_flash
     global _pre_flash_contraction_table, _pre_flash_brltty_text_table
+    global _pre_flash_current_language, _pre_flash_names_locale
     # Only save once per flash session — matches Orca's own _init_flash
     # semantics where a back-to-back display_message doesn't re-save.
-    if _pre_flash_contraction_table is None and _pre_flash_brltty_text_table is None:
-        _pre_flash_contraction_table = _current_contraction_table
-        _pre_flash_brltty_text_table = _current_brltty_text_table
+    if _in_flash:
+        return
+    _in_flash = True
+    _pre_flash_contraction_table = _current_contraction_table
+    _pre_flash_brltty_text_table = _current_brltty_text_table
+    _pre_flash_current_language = _current_language
+    _pre_flash_names_locale = _current_names_locale
 
 
 def _restore_pre_flash_state() -> None:
-    """Restore the contraction + BRLTTY text tables that were active
-    before the most recent flash message, if any.
+    """Restore the state captured before the most recent flash message.
+
+    Restores braille tables (so the focus line re-renders correctly),
+    the speech-side current-language pointer (so a subsequent
+    speak_character on the line doesn't pick up the flash's language),
+    and the symbol-name locale (so symbol announcements track the line
+    again).
     """
+    global _in_flash, _current_language
     global _pre_flash_contraction_table, _pre_flash_brltty_text_table
+    global _pre_flash_current_language, _pre_flash_names_locale
+    if not _in_flash:
+        return
     if _pre_flash_contraction_table is not None:
         _set_contraction_table(_pre_flash_contraction_table)
     if _pre_flash_brltty_text_table is not None:
         _set_brltty_text_table(_pre_flash_brltty_text_table)
+    if _pre_flash_current_language is not None:
+        _current_language = _pre_flash_current_language
+        if _detector is not None:
+            _detector.current_language = _pre_flash_current_language
+    if _pre_flash_names_locale is not None:
+        _set_orca_names_locale(_pre_flash_names_locale)
+    _in_flash = False
     _pre_flash_contraction_table = None
     _pre_flash_brltty_text_table = None
+    _pre_flash_current_language = None
+    _pre_flash_names_locale = None
 
 
 def _switch_braille_tables(lang_settings):
@@ -1005,18 +1048,23 @@ def _set_contraction_table(table_path):
         return
 
     _debug(f"_set_contraction_table: {_current_contraction_table} -> {table_path}")
-    _current_contraction_table = table_path
 
     if not table_path:
+        _current_contraction_table = table_path
         return
 
-    # Orca (liblouis) contraction table
+    # Orca (liblouis) contraction table. Cache the new value only on
+    # success — otherwise a transient liblouis error would leave the
+    # cache claiming we're set when we aren't, suppressing future
+    # same-value calls.
     try:
         from orca import braille
         braille.set_contraction_table(table_path)
+        _current_contraction_table = table_path
         _debug(f"_set_contraction_table: orca done")
     except Exception as e:
         _debug(f"_set_contraction_table: orca ERROR {e}")
+        return
 
     # Also switch BrlTTY text table to match. Skip for braille-only tables
     # (IPA, unicode-braille) — those don't correspond to a spoken language,
@@ -1157,7 +1205,7 @@ def _apply_patches():
                     if not explicit:
                         explicit = _config.default_language
                     _debug(f"_speak: text={text[:40]!r} explicit={explicit}")
-                    _switch_language(explicit)
+                    _switch_language(explicit, also_braille=False)
                     if acss is None:
                         lang_acss = _get_lang_acss(explicit)
                         if lang_acss:
@@ -1167,7 +1215,7 @@ def _apply_patches():
                     detected = _detector.detect(text, statistical=statistical)
                     _debug(f"_speak: text={text[:40]!r} detected={detected}")
                     if detected:
-                        _switch_language(detected)
+                        _switch_language(detected, also_braille=False)
                         lang_acss = _get_lang_acss(detected)
                         if lang_acss:
                             acss = lang_acss
@@ -1277,7 +1325,7 @@ def _apply_patches():
                     if not explicit:
                         explicit = _config.default_language
                     _debug(f"speak_char: char={character!r} explicit={explicit}")
-                    _switch_language(explicit)
+                    _switch_language(explicit, also_braille=False)
                     if acss is None:
                         lang_acss = _get_lang_acss(explicit)
                         if lang_acss:
@@ -1286,7 +1334,7 @@ def _apply_patches():
                     detected = _detector.detect_character(character)
                     _debug(f"speak_char: char={character!r} detected={detected}")
                     if detected:
-                        _switch_language(detected)
+                        _switch_language(detected, also_braille=False)
                         if acss is None:
                             lang_acss = _get_lang_acss(detected)
                             if lang_acss:
@@ -1403,7 +1451,7 @@ def _apply_patches():
                             language = _detector.detect(
                                 string, statistical=statistical)
                     if language:
-                        _switch_language(language)
+                        _switch_language(language, also_braille=False)
                         lang_acss = _get_lang_acss(language)
                         if lang_acss:
                             from orca.acss import ACSS
@@ -1540,27 +1588,40 @@ def _apply_patches():
         _original_kill_flash = braille.kill_flash
 
         def _patched_display_message(message, flash_time=0):
-            _save_pre_flash_state()
-            _switch_to_default_braille_tables()
+            try:
+                if _config and _config.enabled:
+                    _save_pre_flash_state()
+                    _switch_to_default_braille_tables()
+            except Exception as e:
+                _debug(f"display_message pre: ERROR {e}")
             return _original_display_message(message, flash_time)
 
         def _patched_flash_callback():
-            # Restore tables BEFORE the original runs, because the
-            # original calls refresh() which re-renders the saved line
-            # content using whichever tables are currently active.
-            _restore_pre_flash_state()
+            try:
+                # Restore tables BEFORE the original runs, because the
+                # original calls refresh() which re-renders the saved
+                # line content using whichever tables are currently
+                # active.
+                if _config and _config.enabled:
+                    _restore_pre_flash_state()
+            except Exception as e:
+                _debug(f"flash_callback pre: ERROR {e}")
             return _original_flash_callback()
 
         def _patched_kill_flash(restore_saved=True):
-            if restore_saved:
-                _restore_pre_flash_state()
-            else:
-                # Caller is about to display new content; don't restore
-                # to the pre-flash tables — but clear our saved state
-                # so the next display_message can save afresh.
-                global _pre_flash_contraction_table, _pre_flash_brltty_text_table
-                _pre_flash_contraction_table = None
-                _pre_flash_brltty_text_table = None
+            # We always restore (regardless of restore_saved). When the
+            # caller is about to render fresh content, that content's
+            # update_braille will overwrite our restore — a harmless
+            # no-op cache hit since _set_contraction_table short-
+            # circuits on same-value calls. When the caller is NOT
+            # about to update braille (detection_mode=off, empty text,
+            # short-circuit paths), restoring is the right default
+            # rather than letting the flash's tables stick.
+            try:
+                if _config and _config.enabled:
+                    _restore_pre_flash_state()
+            except Exception as e:
+                _debug(f"kill_flash pre: ERROR {e}")
             return _original_kill_flash(restore_saved)
 
         braille.display_message = _patched_display_message

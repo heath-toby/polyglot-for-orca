@@ -1171,11 +1171,8 @@ class PolyglotSettingsWindow(Gtk.Window):
         """Save configuration from dialog state."""
         # General
         mode = self._detection_mode_combo.get_active_id() or "markup_text"
-        if mode == "off":
-            self._config.enabled = False
-        else:
-            self._config.enabled = True
-            self._config.detection_mode = mode
+        self._config.detection_mode = mode
+        self._config.enabled = mode != "off"
         self._config.word_threshold = int(self._threshold_spin.get_value())
         default_lang = self._default_combo.get_active_id()
         if default_lang:

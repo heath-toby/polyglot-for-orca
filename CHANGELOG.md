@@ -5,6 +5,62 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] — 2026-05-05
+
+Polish release fixing one **High** issue and a handful of **Medium**
+and **Low** items that surfaced in a follow-up audit of the v1.1.1
+flash-message work.
+
+### Fixed
+
+- **Flash message snapshot was taken too late.** Orca calls
+  `speech.speak()` *before* `braille.display_message()`, and our
+  `_patched_speak` was switching braille tables as a side effect of
+  detecting the flash text's language. By the time
+  `_patched_display_message` snapshotted the "current" tables, they
+  were already the flash's language, not the focus line's — so the
+  later "restore" put braille onto the wrong tables for a window
+  after the flash. Symptom: focus on an English line, German
+  notification arrives, after the flash the still-displayed English
+  line was in German contraction / BRLTTY tables until the next
+  AT-SPI event triggered `update_braille`. **Fix at the root**:
+  `_patched_speak`, `_patched_speak_character`, and `_patched_voice`
+  no longer touch braille tables (`_switch_language` accepts an
+  `also_braille=False` argument they all pass). `_patched_update_braille`
+  is now the sole authority for the contraction + BRLTTY text tables;
+  the snapshot at flash entry is correct by construction.
+- **Flash patches now wrap their bodies in try/except and respect
+  `_config.enabled`** — bringing them in line with every other
+  monkey-patch in the module. A transient error in our save/restore
+  no longer prevents Orca's flash from rendering.
+- **Flash-state save/restore now covers `_current_language` and the
+  symbol-name locale**, not just the two braille tables. After a
+  flash, character announcements no longer use the flash's name
+  locale ("Komma" for a comma in an English line).
+- **Replaced the dual-`None` "in flash" gate with an explicit
+  `_in_flash` boolean**, fixing a sentinel collision where the very
+  first event after Orca startup could "save" `(None, None)` and
+  leave the state machine confused.
+- **`_set_contraction_table` no longer caches the new value before
+  the underlying call succeeds.** A transient liblouis error would
+  previously leave the cache claiming a successful set, suppressing
+  future same-value calls.
+- **`_switch_to_default_braille_tables` now switches contraction +
+  BRLTTY together or not at all** — half-switched states (BRLTTY on
+  one language, contraction on another) produced wrong braille.
+- **`_patched_kill_flash(restore_saved=False)` now restores
+  pre-flash state too.** Caller-overwrite is a harmless cache hit;
+  caller-no-overwrite (detection_mode=off, empty text, short-circuit
+  paths) gets the right tables instead of leaving the flash's tables
+  to stick.
+- **Detection mode "Off" now writes `detection_mode = "off"`**
+  instead of leaving the prior value in place. State transitions are
+  cleaner; no behavioural change in normal use.
+
+### Removed
+
+- Dead constant `_STATISTICAL_MODES` in `config.py`.
+
 ## [1.1.1] — 2026-05-05
 
 ### Fixed

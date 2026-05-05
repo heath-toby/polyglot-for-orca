@@ -65,11 +65,6 @@ _DEFAULTS = {
     "ignored_apps": [],
 }
 
-# Modes in which we run Lingua statistical detection on plain text.
-# In "off" we run nothing; in "markup_only" we still run the deterministic
-# script tier (Cyrillic, BRAILLE, IPA, …) but never Lingua.
-_STATISTICAL_MODES = ("markup_text", "always")
-
 # --- GSettings helpers ---
 
 _gsettings_available = False
