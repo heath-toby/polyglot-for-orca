@@ -932,6 +932,58 @@ _brltty_conn = None
 _brltty_failed = False
 _current_brltty_text_table = None
 
+# Saved braille-table state for the duration of a flash message
+# (notifications, time announcements, mode strings). Set when
+# display_message fires, restored when _flash_callback or kill_flash
+# restores the underlying line. None means "not currently inside a
+# flash" — distinguishable from an empty string ("no table set").
+_pre_flash_contraction_table: str | None = None
+_pre_flash_brltty_text_table: str | None = None
+
+
+def _switch_to_default_braille_tables() -> None:
+    """Switch contraction + BRLTTY text tables to the default language.
+
+    Used when entering a flash message so that notifications, time
+    announcements, and other non-line content are read in the user's
+    primary language regardless of what the focus line was set to.
+    """
+    if not _config:
+        return
+    default_lang = _config.default_language
+    lang_settings = _config.language_settings.get(default_lang, {})
+    contraction = lang_settings.get("contraction_table", "")
+    if contraction:
+        _set_contraction_table(contraction)
+    # _set_contraction_table already drives BRLTTY text table for
+    # language-named tables. If the default language's contraction
+    # table doesn't match the language-prefix convention, fall back
+    # to setting the BRLTTY text table directly.
+    _set_brltty_text_table(default_lang)
+
+
+def _save_pre_flash_state() -> None:
+    """Snapshot the active braille tables before entering a flash."""
+    global _pre_flash_contraction_table, _pre_flash_brltty_text_table
+    # Only save once per flash session — matches Orca's own _init_flash
+    # semantics where a back-to-back display_message doesn't re-save.
+    if _pre_flash_contraction_table is None and _pre_flash_brltty_text_table is None:
+        _pre_flash_contraction_table = _current_contraction_table
+        _pre_flash_brltty_text_table = _current_brltty_text_table
+
+
+def _restore_pre_flash_state() -> None:
+    """Restore the contraction + BRLTTY text tables that were active
+    before the most recent flash message, if any.
+    """
+    global _pre_flash_contraction_table, _pre_flash_brltty_text_table
+    if _pre_flash_contraction_table is not None:
+        _set_contraction_table(_pre_flash_contraction_table)
+    if _pre_flash_brltty_text_table is not None:
+        _set_brltty_text_table(_pre_flash_brltty_text_table)
+    _pre_flash_contraction_table = None
+    _pre_flash_brltty_text_table = None
+
 
 def _switch_braille_tables(lang_settings):
     """Switch contraction table (Orca/liblouis) and text table (BrlTTY)."""
@@ -1471,6 +1523,51 @@ def _apply_patches():
         DefaultScript.update_braille = _patched_update_braille
     except Exception as e:
         log.warning(f"Polyglot: could not patch update_braille: {e}")
+
+    # Patch braille flash-message lifecycle so notifications, time
+    # announcements, and other non-line content are rendered in the
+    # default-language tables, then revert when the flash ends and the
+    # focus line is restored. Without this, a German line followed by
+    # an English notification flashes in German contraction (or with a
+    # German computer-braille text table on BRLTTY) — and after the
+    # flash, the line content might also stick to whichever tables the
+    # flash ended on.
+    try:
+        from orca import braille
+
+        _original_display_message = braille.display_message
+        _original_flash_callback = braille._flash_callback
+        _original_kill_flash = braille.kill_flash
+
+        def _patched_display_message(message, flash_time=0):
+            _save_pre_flash_state()
+            _switch_to_default_braille_tables()
+            return _original_display_message(message, flash_time)
+
+        def _patched_flash_callback():
+            # Restore tables BEFORE the original runs, because the
+            # original calls refresh() which re-renders the saved line
+            # content using whichever tables are currently active.
+            _restore_pre_flash_state()
+            return _original_flash_callback()
+
+        def _patched_kill_flash(restore_saved=True):
+            if restore_saved:
+                _restore_pre_flash_state()
+            else:
+                # Caller is about to display new content; don't restore
+                # to the pre-flash tables — but clear our saved state
+                # so the next display_message can save afresh.
+                global _pre_flash_contraction_table, _pre_flash_brltty_text_table
+                _pre_flash_contraction_table = None
+                _pre_flash_brltty_text_table = None
+            return _original_kill_flash(restore_saved)
+
+        braille.display_message = _patched_display_message
+        braille._flash_callback = _patched_flash_callback
+        braille.kill_flash = _patched_kill_flash
+    except Exception as e:
+        log.warning(f"Polyglot: could not patch braille flash lifecycle: {e}")
 
 
 # --- Keybinding registration ---

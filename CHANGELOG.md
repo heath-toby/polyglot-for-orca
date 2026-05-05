@@ -5,6 +5,24 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] — 2026-05-05
+
+### Fixed
+
+- **Flash messages now use the default-language braille tables** and
+  revert when the focus line is restored. Previously, a flash
+  (notification, time announcement, mode string) inherited whichever
+  braille tables were active for the focus line — so a German line
+  followed by an English notification flashed in German contraction,
+  or with German computer-braille text-table mappings on BRLTTY.
+  Worse, after the flash, the line content sometimes stayed on the
+  flash's tables until the next caret movement. Now: on
+  `display_message`, contraction (liblouis) and BRLTTY text table
+  switch to the default language; on `_flash_callback` and
+  `kill_flash(restore_saved=True)`, both tables restore to whatever
+  was active before the flash, *before* Orca re-renders the focus
+  line.
+
 ## [1.1.0] — 2026-05-04
 
 ### Added
