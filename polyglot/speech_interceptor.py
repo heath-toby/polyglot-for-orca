@@ -981,8 +981,42 @@ def _switch_to_default_braille_tables() -> None:
         _set_brltty_text_table(default_lang)
 
 
+# "Focus line" state — what update_braille last set for the line of
+# focus. Distinct from _current_* (which any patch can mutate) because
+# speech for a flash message happens BEFORE braille.display_message,
+# and that speech may legitimately change the current state to the
+# flash's language. We need an independent record of the focus line's
+# state to restore to after the flash.
+_focus_line_contraction_table: str | None = None
+_focus_line_brltty_text_table: str | None = None
+_focus_line_language: str | None = None
+_focus_line_names_locale: str | None = None
+
+
+def _record_focus_line_state() -> None:
+    """Pin the current state as the focus line's state.
+
+    Called from _patched_update_braille after it has driven a language
+    switch for the current line. The focus-line snapshot is what flash
+    save/restore uses, so it must not be perturbed by speech-time
+    language switches.
+    """
+    global _focus_line_contraction_table, _focus_line_brltty_text_table
+    global _focus_line_language, _focus_line_names_locale
+    _focus_line_contraction_table = _current_contraction_table
+    _focus_line_brltty_text_table = _current_brltty_text_table
+    _focus_line_language = _current_language
+    _focus_line_names_locale = _current_names_locale
+
+
 def _save_pre_flash_state() -> None:
-    """Snapshot the active state before entering a flash."""
+    """Snapshot the focus line's state before entering a flash.
+
+    Saves _focus_line_* rather than _current_* because speech for the
+    flash message runs before us and has already perturbed _current_*
+    to the flash's language. _focus_line_* is only updated by
+    _patched_update_braille, so it still reflects the focus line.
+    """
     global _in_flash
     global _pre_flash_contraction_table, _pre_flash_brltty_text_table
     global _pre_flash_current_language, _pre_flash_names_locale
@@ -991,10 +1025,10 @@ def _save_pre_flash_state() -> None:
     if _in_flash:
         return
     _in_flash = True
-    _pre_flash_contraction_table = _current_contraction_table
-    _pre_flash_brltty_text_table = _current_brltty_text_table
-    _pre_flash_current_language = _current_language
-    _pre_flash_names_locale = _current_names_locale
+    _pre_flash_contraction_table = _focus_line_contraction_table
+    _pre_flash_brltty_text_table = _focus_line_brltty_text_table
+    _pre_flash_current_language = _focus_line_language
+    _pre_flash_names_locale = _focus_line_names_locale
 
 
 def _restore_pre_flash_state() -> None:
@@ -1324,8 +1358,23 @@ def _apply_patches():
                             character, fallback_to_current=False)
                     if not explicit:
                         explicit = _config.default_language
+                    # Chain: voice() markup → Unicode-script tier →
+                    # focus-line language → default. Adding the focus
+                    # line as a fallback fixes the case where voice()
+                    # didn't resolve markup for a single character and
+                    # the character itself has no script signal —
+                    # without this, a Latin character in a German-
+                    # marked line silently reads in the default
+                    # language.
+                    if not explicit:
+                        explicit = _detector.detect_character(
+                            character, fallback_to_current=False)
+                    if not explicit:
+                        explicit = _focus_line_language
+                    if not explicit:
+                        explicit = _config.default_language
                     _debug(f"speak_char: char={character!r} explicit={explicit}")
-                    _switch_language(explicit, also_braille=False)
+                    _switch_language(explicit)
                     if acss is None:
                         lang_acss = _get_lang_acss(explicit)
                         if lang_acss:
@@ -1334,7 +1383,7 @@ def _apply_patches():
                     detected = _detector.detect_character(character)
                     _debug(f"speak_char: char={character!r} detected={detected}")
                     if detected:
-                        _switch_language(detected, also_braille=False)
+                        _switch_language(detected)
                         if acss is None:
                             lang_acss = _get_lang_acss(detected)
                             if lang_acss:
@@ -1557,6 +1606,10 @@ def _apply_patches():
                             if detected:
                                 _debug(f"update_braille: detected={detected}")
                                 _switch_language(detected)
+                                # Pin this as the focus-line state so the
+                                # flash hook has a clean snapshot
+                                # regardless of any speech-time mutations.
+                                _record_focus_line_state()
             except Exception as e:
                 _debug(f"update_braille pre: ERROR {type(e).__name__}: {e}")
 

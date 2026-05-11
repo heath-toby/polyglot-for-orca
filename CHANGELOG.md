@@ -5,6 +5,45 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.3] — 2026-05-05
+
+Restores two pre-v1.1.2 behaviours that the v1.1.2 architectural
+change accidentally regressed, by introducing a "focus line"
+state tracker that decouples flash-message correctness from
+speech-side mutations.
+
+### Fixed
+
+- **Character navigation now updates braille tables again.** v1.1.2
+  blanket-disabled braille-table switching from speech-side patches
+  to fix a flash-message snapshot bug. But Orca's `update_braille`
+  doesn't always fire on intra-line caret movement, so the braille
+  table stayed stale during character navigation and the user had
+  to scroll line-by-line for braille to track language changes.
+  `_patched_speak_character` now switches braille tables again
+  (the bug it was indirectly causing is fixed differently — see
+  next entry).
+- **Character speech now falls back to the focus line's language
+  before defaulting.** When `voice()` couldn't resolve a markup
+  language for a single character and the character itself had no
+  script signal (i.e., plain Latin in a markup-tagged line), the
+  fallback chain hit "default language" — so a Latin character in
+  a German-marked line would silently read in English. Chain is
+  now: voice()'s ACSS family.lang → Unicode-script detection →
+  focus-line language → default. Closes the "markup reads right
+  on line, but character navigation reads English" gap.
+- **Flash-message snapshot now reads from a focus-line tracker
+  rather than `_current_*`.** This is what makes the two fixes
+  above safe to ship together. `_record_focus_line_state` runs
+  inside `_patched_update_braille` after the language switch, and
+  the flash hook saves/restores that snapshot — so speech for the
+  flash message can perturb `_current_*` (which it does, because
+  `_patched_speak` still detects the flash language) without
+  contaminating the saved focus-line state. The v1.1.2 fix
+  prevented contamination by stopping speech-side patches from
+  touching braille at all; this release prevents it via state
+  separation instead, which is the right architectural answer.
+
 ## [1.1.2] — 2026-05-05
 
 Polish release fixing one **High** issue and a handful of **Medium**
