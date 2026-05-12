@@ -960,10 +960,18 @@ _current_brltty_text_table = None
 # None (e.g. before any line has been focused, no contraction table
 # is set yet — "saving" None is a legitimate "no-op on restore").
 _in_flash = False
-_pre_flash_contraction_table: str | None = None
-_pre_flash_brltty_text_table: str | None = None
-_pre_flash_current_language: str | None = None
-_pre_flash_names_locale: str | None = None
+# Snapshot of the focus line's tables at the moment a flash starts.
+# Used both as the values to restore to AND (compared against the
+# current _focus_line_* values) to detect navigation during the flash.
+_pre_flash_focus_contraction: str | None = None
+_pre_flash_focus_brltty: str | None = None
+# What the tables actually became after _switch_to_default_braille_tables.
+# Used at restore time to detect whether speech-side switching changed
+# the tables during the flash (e.g. user navigated into German content
+# while a flash was still showing — _patched_speak switched tables, and
+# we must not undo that legitimate change).
+_flash_default_contraction: str | None = None
+_flash_default_brltty: str | None = None
 
 
 def _switch_to_default_braille_tables() -> None:
@@ -972,7 +980,11 @@ def _switch_to_default_braille_tables() -> None:
     Used when entering a flash message so that notifications, time
     announcements, and other non-line content are read in the user's
     primary language regardless of what the focus line was set to.
+    Records the resulting "flash default" so the restore step can
+    distinguish "tables unchanged since flash" from "tables changed
+    by speech during flash".
     """
+    global _flash_default_contraction, _flash_default_brltty
     if not _config:
         return
     default_lang = _config.default_language
@@ -985,6 +997,10 @@ def _switch_to_default_braille_tables() -> None:
     if contraction:
         _set_contraction_table(contraction)
         _set_brltty_text_table(default_lang)
+    # Capture whatever the tables actually are after the switch attempt
+    # (which may have no-op'd if contraction was unset or matched).
+    _flash_default_contraction = _current_contraction_table
+    _flash_default_brltty = _current_brltty_text_table
 
 
 # "Focus line" state — what update_braille last set for the line of
@@ -1016,56 +1032,66 @@ def _record_focus_line_state() -> None:
 
 
 def _save_pre_flash_state() -> None:
-    """Snapshot the focus line's state before entering a flash.
+    """Snapshot the focus line's braille tables before entering a flash.
 
     Saves _focus_line_* rather than _current_* because speech for the
     flash message runs before us and has already perturbed _current_*
     to the flash's language. _focus_line_* is only updated by
     _patched_update_braille, so it still reflects the focus line.
     """
-    global _in_flash
-    global _pre_flash_contraction_table, _pre_flash_brltty_text_table
-    global _pre_flash_current_language, _pre_flash_names_locale
+    global _in_flash, _pre_flash_focus_contraction, _pre_flash_focus_brltty
     # Only save once per flash session — matches Orca's own _init_flash
     # semantics where a back-to-back display_message doesn't re-save.
     if _in_flash:
         return
     _in_flash = True
-    _pre_flash_contraction_table = _focus_line_contraction_table
-    _pre_flash_brltty_text_table = _focus_line_brltty_text_table
-    _pre_flash_current_language = _focus_line_language
-    _pre_flash_names_locale = _focus_line_names_locale
+    _pre_flash_focus_contraction = _focus_line_contraction_table
+    _pre_flash_focus_brltty = _focus_line_brltty_text_table
 
 
 def _restore_pre_flash_state() -> None:
-    """Restore the state captured before the most recent flash message.
+    """Restore the focus line's braille tables — but only if nothing
+    legitimate happened during the flash that would make the restore
+    incorrect.
 
-    Restores braille tables (so the focus line re-renders correctly),
-    the speech-side current-language pointer (so a subsequent
-    speak_character on the line doesn't pick up the flash's language),
-    and the symbol-name locale (so symbol announcements track the line
-    again).
+    Two situations leave tables in a state we mustn't undo:
+
+      1. Speech during the flash switched tables to a different
+         language (e.g. user navigated into German content while
+         a flash was still active; ``_patched_speak`` updated the
+         tables for the German speech). In this case tables no
+         longer match ``_flash_default_*``.
+
+      2. ``_patched_update_braille`` ran for a new line during the
+         flash. ``_focus_line_*`` now differs from the snapshot we
+         saved at flash entry.
+
+    Either condition means the post-flash content is on a different
+    line/language than where the flash started. Don't restore — the
+    current state is correct.
     """
-    global _in_flash, _current_language
-    global _pre_flash_contraction_table, _pre_flash_brltty_text_table
-    global _pre_flash_current_language, _pre_flash_names_locale
+    global _in_flash, _pre_flash_focus_contraction, _pre_flash_focus_brltty
+    global _flash_default_contraction, _flash_default_brltty
     if not _in_flash:
         return
-    if _pre_flash_contraction_table is not None:
-        _set_contraction_table(_pre_flash_contraction_table)
-    if _pre_flash_brltty_text_table is not None:
-        _set_brltty_text_table(_pre_flash_brltty_text_table)
-    if _pre_flash_current_language is not None:
-        _current_language = _pre_flash_current_language
-        if _detector is not None:
-            _detector.current_language = _pre_flash_current_language
-    if _pre_flash_names_locale is not None:
-        _set_orca_names_locale(_pre_flash_names_locale)
+    tables_still_flash_default = (
+        _current_contraction_table == _flash_default_contraction
+        and _current_brltty_text_table == _flash_default_brltty
+    )
+    focus_line_unchanged = (
+        _focus_line_contraction_table == _pre_flash_focus_contraction
+        and _focus_line_brltty_text_table == _pre_flash_focus_brltty
+    )
+    if tables_still_flash_default and focus_line_unchanged:
+        if _pre_flash_focus_contraction is not None:
+            _set_contraction_table(_pre_flash_focus_contraction)
+        if _pre_flash_focus_brltty is not None:
+            _set_brltty_text_table(_pre_flash_focus_brltty)
     _in_flash = False
-    _pre_flash_contraction_table = None
-    _pre_flash_brltty_text_table = None
-    _pre_flash_current_language = None
-    _pre_flash_names_locale = None
+    _pre_flash_focus_contraction = None
+    _pre_flash_focus_brltty = None
+    _flash_default_contraction = None
+    _flash_default_brltty = None
 
 
 def _switch_braille_tables(lang_settings):

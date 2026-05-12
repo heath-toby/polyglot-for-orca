@@ -5,6 +5,40 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.7] — 2026-05-12
+
+### Fixed
+
+- **Flash restore no longer undoes legitimate post-flash language
+  switches.** When a flash message (e.g. "Focus mode" on app
+  switch) was active and the user navigated into content of a
+  different language during the flash, `_patched_speak` correctly
+  switched braille tables to the new language — and then the
+  flash's `_restore_pre_flash_state` ran on flash expiry and put
+  the tables back to the pre-flash values. The user had to bump
+  the caret (line up + line down) to trigger another
+  `update_braille` and re-switch the tables. Symptom traced
+  live in the debug log:
+
+      _speak: trust acss lang=de text='Versuchen wir, …'
+      _set_contraction_table: en -> de           ← correct
+      _set_brltty_text_table: en -> de
+      _set_contraction_table: de -> en           ← flash restore stomped it
+      _set_brltty_text_table: de -> en
+
+  Restore now checks two conditions before applying: (a) the
+  tables are still at the flash-default values (no speech-side
+  switch has happened), AND (b) `_focus_line_*` is unchanged
+  (no `update_braille` has fired for a new line). If either
+  changed during the flash, the current state already reflects
+  the right language for what the user is doing — leave alone.
+- Dropped `_current_language` and `_current_names_locale` from
+  flash save/restore. Those are speech-side state and self-
+  correct on the next voice resolution. Restoring them
+  unconditionally was the secondary mechanism causing the
+  symptom above to feel "sticky" even after a single caret
+  movement (it took a `update_braille` to fully clear).
+
 ## [1.1.6] — 2026-05-12
 
 ### Changed
