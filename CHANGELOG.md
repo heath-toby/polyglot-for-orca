@@ -5,6 +5,29 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.5] — 2026-05-05
+
+### Fixed
+
+- **`_switch_language` no longer short-circuits braille work when
+  the same language has already been set with `also_braille=False`.**
+  Speech-side patches pass `also_braille=False` so they don't flap
+  tables mid-utterance; they still update `_current_language`.
+  When `_patched_update_braille` then called `_switch_language` for
+  the same language with the default `also_braille=True`, the early
+  return `if lang_code == _current_language: return` fired *before*
+  reaching the braille block — so tables stayed on the previous
+  language indefinitely. Symptom: caught live on the user's debug
+  log:
+
+      _switch_language: en -> de (also_braille=False)
+      update_braille: detected=de         ← never followed by a set_contraction_table
+
+  Fix: only short-circuit when the caller doesn't want braille
+  switched. If `also_braille=True`, fall through so the table-
+  level helpers can decide whether they're actually no-ops (they
+  already short-circuit on identical values, so this is cheap).
+
 ## [1.1.4] — 2026-05-05
 
 ### Fixed

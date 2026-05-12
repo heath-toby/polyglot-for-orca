@@ -872,7 +872,13 @@ def _switch_language(lang_code, also_braille: bool = True):
             _set_contraction_table("/usr/share/liblouis/tables/unicode-braille.utb")
         return
 
-    if lang_code == _current_language:
+    # If the language is already current AND the caller doesn't care
+    # about braille, there's nothing to do. But when also_braille=True
+    # the braille tables may still be lagging — speech-side calls with
+    # also_braille=False set _current_language but skip the table
+    # switch, so a follow-up update_braille for the same language
+    # needs to fall through to _switch_braille_tables.
+    if lang_code == _current_language and not also_braille:
         return
 
     if lang_code not in _lang_acss_cache:
