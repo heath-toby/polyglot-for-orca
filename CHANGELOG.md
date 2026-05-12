@@ -5,6 +5,36 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.6] — 2026-05-12
+
+### Changed
+
+- **The "Split mixed-language text into segments" setting is now
+  the single switch for mid-line language changes.** With it
+  **off** (default), every line speaks (and brailles) in its
+  dominant language — the value `AXObject.get_locale` reports for
+  the paragraph / line obj. With it **on**, per-segment markup
+  and Lingua-driven splitting can flip mid-line as before.
+  - `_patched_voice` ignores `args.language` (range-specific
+    markup from `generate_line`'s `split_substring_by_language`)
+    in non-mixed mode. Falls through to obj-locale, which is one
+    consistent value per line.
+  - `_patched_speak` trusts the ACSS family.lang voice() resolved
+    in non-mixed mode. Skips per-utterance text detection, which
+    was the source of word-navigation language flips on
+    statistically-ambiguous short text. The "Words before
+    switching" threshold becomes largely advisory in non-mixed
+    mode; switches still happen but at line boundaries (where
+    update_braille drives them), not per word.
+
+Fixes the user-reported pattern: "word navigation sometimes
+thinks I'm reading English, then line navigation correctly says
+German" — the line's obj-locale is consistent; only per-utterance
+detection on a single word's worth of text was ambiguous.
+
+The mixed-language checkbox stays as the user-facing knob for
+"I have multilingual content and want mid-line switching".
+
 ## [1.1.5] — 2026-05-05
 
 ### Fixed

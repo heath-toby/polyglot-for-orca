@@ -1227,7 +1227,22 @@ def _apply_patches():
                     and isinstance(text, str) and not _is_app_ignored()
                     and _config.detection_mode != "off"):
                 mode = _config.detection_mode
-                if mode == "markup_only":
+                # In non-mixed mode, if voice() already produced an
+                # ACSS with a usable language (set from obj-locale at
+                # the line/paragraph level), trust it. Skips re-
+                # detecting per utterance, which would otherwise flip
+                # voice mid-line on a German word in an English
+                # paragraph or a low word-threshold statistical hit.
+                # Mixed mode keeps per-utterance detection.
+                trusted_lang = None
+                if not _config.enable_mixed_language:
+                    candidate = _acss_lang(acss)
+                    if candidate and candidate in _lang_acss_cache:
+                        trusted_lang = candidate
+                if trusted_lang:
+                    _debug(f"_speak: trust acss lang={trusted_lang} text={text[:40]!r}")
+                    _switch_language(trusted_lang)
+                elif mode == "markup_only":
                     # Strict rule: explicit signal → that language;
                     # otherwise default. The signal is either (a) the
                     # ACSS family.lang voice() resolved upstream, or
@@ -1463,10 +1478,18 @@ def _apply_patches():
                     # markup hint when present. Normalize whatever we got
                     # so "de_DE", "de-DE", "DE" all collapse to "de".
                     raw_lang = args.get("language")
-                    language = (
-                        None if mode == "always"
-                        else _normalize_lang_code(raw_lang)
-                    )
+                    # "always" mode ignores all markup. In non-mixed
+                    # mode, we also ignore range-specific markup
+                    # (args.language comes from generate_line splitting
+                    # by per-character language attributes) so the
+                    # whole line reads in one language — the line's
+                    # dominant one, determined by obj-locale just
+                    # below. Mixed mode is the only place per-segment
+                    # markup wins.
+                    if mode == "always" or not _config.enable_mixed_language:
+                        language = None
+                    else:
+                        language = _normalize_lang_code(raw_lang)
 
                     # Fall back to the object's reported locale. Mirrors
                     # Orca's _resolve_language_and_dialect. Required for
