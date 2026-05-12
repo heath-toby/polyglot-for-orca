@@ -5,6 +5,41 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.4] — 2026-05-05
+
+### Fixed
+
+- **`_patched_speak` now switches braille tables again** (reverts
+  the `also_braille=False` from v1.1.2 for this patch only).
+  v1.1.2 disabled it to fix the flash-snapshot bug; v1.1.3
+  introduced the `_focus_line_*` tracker which makes the flash
+  snapshot correct *regardless* of what speech-side patches do.
+  With that protection in place, restoring v1.1.0's speech-driven
+  table updates is safe — and it restores speech's role as a
+  "second pass" that corrects any miss from `update_braille`.
+  Symptom this fixes: in *always* mode (Lingua statistical
+  detection), braille tables would lag a long way behind speech
+  — German content reading in default tables for half a passage
+  before switching, and not switching back to default until well
+  past the word threshold.
+- **`_patched_speak_character` markup-only fallback chain** —
+  removed the `_focus_line_language` step that v1.1.3 added,
+  reverted `detect_character` to `fallback_to_current=True`. The
+  `_focus_line_language` tracker was stale on intra-line caret
+  movement (update_braille doesn't fire there), so it could
+  point at a previous line's language. The detector's own
+  `_current_language` is kept fresh by speech and is the better
+  per-character fallback.
+
+`_patched_voice` keeps `also_braille=False`. Voice() is called
+per-segment in mixed-language line reading; if it switched braille
+each call, the line's braille would flap mid-line between
+segment languages. The line should braille in one language (the
+dominant or first), set once by `update_braille`. Speech-side
+calls (speak, speak_character) are different — they're per
+utterance / per character within a single language context, so
+their table updates are corrective, not flappy.
+
 ## [1.1.3] — 2026-05-05
 
 Restores two pre-v1.1.2 behaviours that the v1.1.2 architectural

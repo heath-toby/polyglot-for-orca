@@ -1239,7 +1239,7 @@ def _apply_patches():
                     if not explicit:
                         explicit = _config.default_language
                     _debug(f"_speak: text={text[:40]!r} explicit={explicit}")
-                    _switch_language(explicit, also_braille=False)
+                    _switch_language(explicit)
                     if acss is None:
                         lang_acss = _get_lang_acss(explicit)
                         if lang_acss:
@@ -1249,7 +1249,7 @@ def _apply_patches():
                     detected = _detector.detect(text, statistical=statistical)
                     _debug(f"_speak: text={text[:40]!r} detected={detected}")
                     if detected:
-                        _switch_language(detected, also_braille=False)
+                        _switch_language(detected)
                         lang_acss = _get_lang_acss(detected)
                         if lang_acss:
                             acss = lang_acss
@@ -1358,19 +1358,14 @@ def _apply_patches():
                             character, fallback_to_current=False)
                     if not explicit:
                         explicit = _config.default_language
-                    # Chain: voice() markup → Unicode-script tier →
-                    # focus-line language → default. Adding the focus
-                    # line as a fallback fixes the case where voice()
-                    # didn't resolve markup for a single character and
-                    # the character itself has no script signal —
-                    # without this, a Latin character in a German-
-                    # marked line silently reads in the default
-                    # language.
+                    # Chain: voice() markup → Unicode-script tier
+                    # (with current-language fallback, since per-char
+                    # detection can't run Lingua and Latin chars have
+                    # no script signal — falling back to current is
+                    # the only way to inherit line context) → default.
                     if not explicit:
                         explicit = _detector.detect_character(
-                            character, fallback_to_current=False)
-                    if not explicit:
-                        explicit = _focus_line_language
+                            character, fallback_to_current=True)
                     if not explicit:
                         explicit = _config.default_language
                     _debug(f"speak_char: char={character!r} explicit={explicit}")
