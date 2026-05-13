@@ -5,6 +5,30 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.10] — 2026-05-12
+
+### Fixed
+
+- **Multi-component emoji names (ZWJ sequences) like
+  `:family_man_woman_girl:` no longer mangle when preceded by a
+  literal label colon.** `_expand_emojis`'s regex was
+  `r":([^:]+):"` — character class excluded colons but not
+  whitespace. For input "Family: :family_man_woman_girl:", that
+  greedily matched `": :"` (label colon, space, emoji's leading
+  colon) before reaching the real emoji name, eating its start
+  and leaving the rest unmatched. Symptom: ZWJ family sequences
+  rendered as `"Family family_man_woman_girl:"` with underscores
+  un-substituted and a trailing colon. Fix is a one-character
+  regex tweak — `[^\s:]` instead of `[^:]` — so the emoji name
+  match can't span whitespace.
+
+  Now reads cleanly:
+  - `"Family: 👨‍👩‍👧"` → `"Family: family man woman girl"`
+  - `"Reactions: 👨‍👩‍👧‍👦 then 🇬🇧"` →
+    `"Reactions: family man woman girl boy then United Kingdom"`
+  - Label colons in non-emoji contexts (URLs, times like
+    `12:30`, `var:value`) pass through untouched.
+
 ## [1.1.9] — 2026-05-12
 
 ### Fixed

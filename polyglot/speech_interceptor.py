@@ -110,7 +110,13 @@ def _expand_emojis(text, lang_code=None):
         name = m.group(1).replace("_", " ")
         return f" {name} "
 
-    result = _re.sub(r":([^:]+):", _replace, demojized)
+    # The character class excludes whitespace as well as colons.
+    # Without that, a literal label colon followed by an emoji name
+    # — e.g. "Family: :family_man_woman_girl:" — would let the
+    # regex greedily match the label colon + space + the emoji's
+    # leading colon as a fake ":<space>:" pair, eating the start
+    # of the real emoji name and mangling the rest.
+    result = _re.sub(r":([^\s:]+):", _replace, demojized)
     result = _re.sub(r"  +", " ", result).strip()
     return result
 
