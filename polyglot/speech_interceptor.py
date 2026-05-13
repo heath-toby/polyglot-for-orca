@@ -551,10 +551,31 @@ _INVISIBLE_FORMATTING = set(
 
 
 def _is_invisible_formatting(char):
-    """Check if a character is an invisible formatting character."""
+    """Check if a character is an invisible formatting character.
+
+    Returns True for codepoints that exist purely as rendering hints
+    or modifiers on a neighbouring base, and have no spoken value on
+    their own in brief mode. In verbose mode the caller still
+    announces them by name — power users may want to know a VS-16 is
+    attached to a heart.
+    """
     if char in _INVISIBLE_FORMATTING:
         return True
-    # Also catch any remaining Cf (Format) category chars not in the set
+    cp = ord(char)
+    # Variation selectors. VS-1..16 (U+FE00..FE0F) toggle text vs
+    # emoji rendering or pick script-specific glyph variants. VS-17..
+    # 256 (U+E0100..E01EF) pick Han ideograph variants. Both are
+    # category Mn, so not caught by the Cf catch-all below.
+    if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:
+        return True
+    # Regional indicator symbols (U+1F1E6..1F1FF). Pairs of these
+    # form flag emojis; the emoji module resolves complete pairs into
+    # country names in line reading. Reading each indicator letter
+    # individually as "REGIONAL INDICATOR SYMBOL LETTER G" is just
+    # noise. Category So, also not caught below.
+    if 0x1F1E6 <= cp <= 0x1F1FF:
+        return True
+    # Catch any remaining Cf (Format) category chars not in the set
     return _unicodedata.category(char) == "Cf"
 
 

@@ -5,6 +5,34 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.8] — 2026-05-12
+
+### Changed
+
+- **Brief-mode Unicode announcements now silence variation
+  selectors and regional indicator letters.** Both were leaking
+  through the existing invisible-formatting filter because
+  variation selectors are category Mn (combining mark) and
+  regional indicators are So (other symbol) — neither caught
+  by the catch-all Cf check.
+  - **Variation selectors** U+FE00..FE0F + U+E0100..E01EF.
+    VS-16 in particular is attached to most emoji to request
+    emoji-style rendering; you'd hear "red heart variation
+    selector 16" instead of just "red heart". Now: silent in
+    brief, still named in verbose for users who need to know.
+  - **Regional indicator letters** U+1F1E6..1F1FF. Pairs of
+    these form flag emojis ("🇬🇧" = "G" + "B" → UK flag); the
+    emoji module resolves complete pairs into country names in
+    line reading. Reading each letter individually as "REGIONAL
+    INDICATOR SYMBOL LETTER G" added noise without information.
+    Now: silent in brief, still named in verbose.
+
+Verbose mode is unchanged — both ranges still announce by name
+for users who want to know about every codepoint. Skin-tone
+emoji modifiers (U+1F3FB..1F3FF) are left as-is: they carry real
+semantic content and already read tolerably ("medium skin tone"
+etc.) via the emoji module.
+
 ## [1.1.7] — 2026-05-12
 
 ### Fixed
