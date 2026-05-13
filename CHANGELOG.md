@@ -5,6 +5,29 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.9] — 2026-05-12
+
+### Fixed
+
+- **Flag emoji (regional-indicator pairs) silently dropped from
+  speech and braille after v1.1.8.** The v1.1.8 regional-indicator
+  silencing in `_is_invisible_formatting` fired in
+  `_expand_unpronounceable`, which runs in
+  `presenter.adjust_for_presentation` — that's *upstream* of
+  `_patched_speak`'s `_expand_emojis` call. So the regional
+  indicators were stripped from the text before the emoji module
+  ever saw them, and the flag was never resolved to its country
+  name. Symptom: a chat message ending in `🇬🇧` produced silence
+  instead of "United Kingdom".
+- **Fix**: `_expand_unpronounceable` now runs whole-string emoji
+  expansion FIRST (idempotent — if `_patched_speak` runs it again
+  later, the second call no-ops). Multi-codepoint sequences
+  (flag pairs, heart+VS-16, ZWJ family sequences) get resolved to
+  their full names while their constituent codepoints are still
+  intact. Orphan regional indicators (a single unpaired letter)
+  still get silenced in brief mode, since they're not part of a
+  valid emoji sequence.
+
 ## [1.1.8] — 2026-05-12
 
 ### Changed

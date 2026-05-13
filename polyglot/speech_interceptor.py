@@ -673,9 +673,21 @@ def _expand_unpronounceable(text, verbosity="verbose"):
     "6 light horizontal characters" instead of repeating the name.
 
     In "brief" mode, invisible formatting chars are silently dropped.
+
+    Runs whole-string emoji expansion FIRST so multi-codepoint
+    sequences (regional-indicator flag pairs, heart+VS-16, ZWJ family
+    sequences, …) get resolved to their full names while their
+    constituent codepoints are still intact. Without this step,
+    per-char processing would strip invisible parts of the sequence
+    (e.g. the regional indicators in brief mode after v1.1.8),
+    leaving nothing for downstream emoji handlers to recognise.
     """
     if not text:
         return text
+    # Step 1: whole-string emoji expansion. Idempotent — if called
+    # again later (e.g. by _patched_speak), the second call no-ops.
+    if (_config and _config.speak_emojis and _emoji_available):
+        text = _expand_emojis(text, _current_language)
     # Quick check: if all characters are pronounceable, skip processing
     if all(_is_pronounceable(c) for c in text):
         return text
