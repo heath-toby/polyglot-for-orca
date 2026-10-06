@@ -98,37 +98,18 @@ _EVENTS_TO_SUSPEND = (
 )
 
 # Cache
-_speechd_voices_cache = None
 _contraction_tables_cache = None
 
 
-def _get_speech_dispatcher_voices():
-    """Get available voices from Speech Dispatcher, cached."""
-    global _speechd_voices_cache
-    if _speechd_voices_cache is not None:
-        return _speechd_voices_cache
-    voices = []
-    languages = set()
-    try:
-        import speechd
-        client = speechd.SSIPClient("polyglot-config")
-        try:
-            for voice_name, lang_code, variant in client.list_synthesis_voices():
-                if lang_code:
-                    base = lang_code.split("-")[0].split("_")[0].lower()
-                    voices.append((voice_name, lang_code, variant, base))
-                    languages.add(base)
-        finally:
-            client.close()
-    except Exception:
-        pass
-    _speechd_voices_cache = (voices, sorted(languages))
-    return _speechd_voices_cache
-
-
 def _get_speech_dispatcher_languages():
-    _, languages = _get_speech_dispatcher_voices()
-    return languages
+    """The languages Speech Dispatcher has a voice for.
+
+    Which voice is used for each is Orca's business now -- see the Voice
+    Sets page in Orca's own preferences. All this page needs to know is
+    which languages are worth offering to detect.
+    """
+    from .available_voices import languages
+    return languages()
 
 
 def _get_contraction_tables():
@@ -147,6 +128,17 @@ def _get_contraction_tables():
         pass
     _contraction_tables_cache = tables
     return tables
+
+
+# Offered orders for the detection tiers. Not every permutation: these are
+# the ones with a reason to exist. The stored value is the comma-joined tier
+# list, which is what config.detection_order holds.
+_DETECTION_ORDER_CHOICES = (
+    (("script", "dictionary", "lingua"), "Script, then word lists, then Lingua"),
+    (("dictionary", "script", "lingua"), "Word lists, then script, then Lingua"),
+    (("script", "lingua", "dictionary"), "Script, then Lingua, then word lists"),
+    (("dictionary", "lingua", "script"), "Word lists, then Lingua, then script"),
+)
 
 
 def _suspend_events():
@@ -348,6 +340,34 @@ def _create_spin_row(label_text, lower, upper, step, digits=0,
     return row, spin, label
 
 
+def _create_text_row(label_text, value="", atk_name=None, atk_desc=None):
+    """Create a ListBoxRow with Label (left) + Entry (right)."""
+    row = Gtk.ListBoxRow()
+    row.set_activatable(False)
+    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    hbox.set_margin_start(12)
+    hbox.set_margin_end(12)
+    hbox.set_margin_top(12)
+    hbox.set_margin_bottom(12)
+    label = Gtk.Label(label=label_text)
+    label.set_use_underline(True)
+    label.set_xalign(0)
+    entry = Gtk.Entry()
+    entry.set_text(value or "")
+    entry.set_hexpand(True)
+    label.set_mnemonic_widget(entry)
+    atk_obj = entry.get_accessible()
+    if atk_obj:
+        if atk_name:
+            atk_obj.set_name(atk_name)
+        if atk_desc:
+            atk_obj.set_description(atk_desc)
+    hbox.pack_start(label, False, False, 0)
+    hbox.pack_start(entry, True, True, 0)
+    row.add(hbox)
+    return row, entry, label
+
+
 def _create_section_heading(text):
     """Create a section heading label."""
     label = Gtk.Label(label=text)
@@ -359,115 +379,402 @@ def _create_section_heading(text):
 
 
 # ---------------------------------------------------------------------------
-# Per-language voice settings dialog
+# Speech dictionary editor
 # ---------------------------------------------------------------------------
 
-class LanguageSettingsDialog(Gtk.Dialog):
-    """Dialog for configuring voice, rate, pitch, gain, and braille for a language."""
+_RULE_TYPE_LABELS = (
+    ("text", "Text replacement"),
+    ("regex", "Regular expression"),
+)
 
-    def __init__(self, parent, lang_code, lang_settings):
-        display_name = _LANG_DISPLAY_NAMES.get(lang_code, lang_code)
+
+class SpeechRuleDialog(Gtk.Dialog):
+    """Add or edit one speech dictionary rule.
+
+    The Test field is the point of this dialog rather than an extra: a
+    regular expression that does not work gives no clue as to why, and
+    nothing here is visible on a braille display or in speech unless it is
+    spelled out. Typing a sample shows what the rule does to it, as it is
+    typed.
+    """
+
+    def __init__(self, parent, entry=None, languages=(), sample=""):
+        editing = entry is not None
         super().__init__(
-            title=f"Settings for {display_name}",
+            title="Edit Pronunciation" if editing else "Add Pronunciation",
             transient_for=parent,
             flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
         )
-        self._lang_code = lang_code
         self._result = None
-        self.set_default_size(450, 350)
+        # Set while a deep validation is pending; see _refresh.
+        self._deep_timer = None
+        self._deep_checked = None
+        self._languages = list(languages)
+        self.set_default_size(560, 460)
         self.set_border_width(12)
+
+        entry = dict(entry) if entry else {
+            "type": "text", "pattern": "", "replacement": "", "language": "",
+            "case_sensitive": False, "whole_word": True, "enabled": True,
+            "comment": "",
+        }
 
         atk_obj = self.get_accessible()
         if atk_obj:
-            atk_obj.set_name(f"Voice settings for {display_name}")
+            atk_obj.set_name("Edit pronunciation" if editing else "Add pronunciation")
 
         content = self.get_content_area()
         listbox = FocusManagedListBox()
 
-        # Voice selector
-        row, self._voice_combo, _ = _create_combo_row(
-            "_Voice:", atk_name=f"Voice for {display_name}")
-        self._voice_combo.append("", "(Default)")
-        all_voices, _ = _get_speech_dispatcher_voices()
-        current_voice = lang_settings.get("voice_name", "")
-        found_current = False
-        for voice_name, voice_lang, variant, base_lang in all_voices:
-            self._voice_combo.append(voice_name, f"{voice_name} ({voice_lang})")
-            if voice_name == current_voice:
-                found_current = True
-        if found_current:
-            self._voice_combo.set_active_id(current_voice)
-        else:
-            self._voice_combo.set_active(0)
-        listbox.add_row_with_widget(row, self._voice_combo)
+        row, self._type_combo, _ = _create_combo_row(
+            "_Kind of rule:",
+            atk_name="Kind of rule",
+            atk_desc="Text replacement swaps one piece of text for another. "
+                     "Regular expression matches a pattern and can reuse parts "
+                     "of what it matched.")
+        for value, label in _RULE_TYPE_LABELS:
+            self._type_combo.append(value, label)
+        self._type_combo.set_active_id(entry["type"])
+        if self._type_combo.get_active_id() is None:
+            self._type_combo.set_active_id("text")
+        listbox.add_row_with_widget(row, self._type_combo)
 
-        # Rate
-        row, self._rate_spin, _ = _create_spin_row(
-            "_Rate:", 0, 100, 1, value=lang_settings.get("rate", 50.0),
-            atk_name=f"Speech rate for {display_name}")
-        listbox.add_row_with_widget(row, self._rate_spin)
+        row, self._pattern_entry, _ = _create_text_row(
+            "_Replace:", entry["pattern"],
+            atk_name="Text or pattern to replace",
+            atk_desc="The text to look for, or the pattern when the rule is a "
+                     "regular expression")
+        listbox.add_row_with_widget(row, self._pattern_entry)
 
-        # Pitch
-        row, self._pitch_spin, _ = _create_spin_row(
-            "_Pitch:", 0, 10, 0.5, digits=1,
-            value=lang_settings.get("average_pitch", 5.0),
-            atk_name=f"Pitch for {display_name}")
-        listbox.add_row_with_widget(row, self._pitch_spin)
+        row, self._replacement_entry, _ = _create_text_row(
+            "_With:", entry["replacement"],
+            atk_name="Replacement",
+            atk_desc="What to say instead. In a regular expression, backslash 1 "
+                     "stands for the first bracketed part of the pattern, "
+                     "backslash 2 for the second, and so on")
+        listbox.add_row_with_widget(row, self._replacement_entry)
 
-        # Gain/Volume
-        row, self._gain_spin, _ = _create_spin_row(
-            "V_olume/Gain:", 0, 100, 1, value=lang_settings.get("gain", 10.0),
-            atk_name=f"Volume for {display_name}")
-        listbox.add_row_with_widget(row, self._gain_spin)
+        row, self._language_combo, _ = _create_combo_row(
+            "_Language:",
+            atk_name="Language this rule applies to",
+            atk_desc="Restrict the rule to one language, or apply it to all of them")
+        self._language_combo.append("", "All languages")
+        for code in self._languages:
+            self._language_combo.append(
+                code, f"{_LANG_DISPLAY_NAMES.get(code, code)} ({code})")
+        self._language_combo.set_active_id(entry["language"])
+        if self._language_combo.get_active_id() is None:
+            self._language_combo.set_active_id("")
+        listbox.add_row_with_widget(row, self._language_combo)
 
-        # Contraction table
-        row, self._contraction_combo, _ = _create_combo_row(
-            "_Contraction table:",
-            atk_name=f"Contraction table for {display_name}")
-        self._contraction_combo.append("", "(No change)")
-        contraction_tables = _get_contraction_tables()
-        current_ct = lang_settings.get("contraction_table", "")
-        for table_display, full_path in sorted(contraction_tables.items()):
-            self._contraction_combo.append(full_path, table_display)
-        if current_ct:
-            self._contraction_combo.set_active_id(current_ct)
-        else:
-            self._contraction_combo.set_active(0)
-        listbox.add_row_with_widget(row, self._contraction_combo)
+        row, self._case_switch, _ = _create_switch_row(
+            "Match _capitals exactly", entry["case_sensitive"],
+            atk_name="Match capitals exactly",
+            atk_desc="When off, US and us are treated as the same text")
+        listbox.add_row_with_widget(row, self._case_switch)
 
-        content.pack_start(listbox, True, True, 0)
+        row, self._whole_switch, self._whole_label = _create_switch_row(
+            "Whole _words only", entry["whole_word"],
+            atk_name="Whole words only",
+            atk_desc="When on, cat does not match inside concatenate. Applies "
+                     "to text replacement only")
+        listbox.add_row_with_widget(row, self._whole_switch)
+
+        row, self._test_entry, _ = _create_text_row(
+            "_Test with:", sample,
+            atk_name="Test text",
+            atk_desc="Type a sample here to see what this rule does to it")
+        listbox.add_row_with_widget(row, self._test_entry)
+
+        content.pack_start(listbox, False, False, 0)
+
+        self._result_label = Gtk.Label()
+        self._result_label.set_xalign(0)
+        self._result_label.set_line_wrap(True)
+        self._result_label.set_selectable(True)
+        self._result_label.set_margin_top(8)
+        result_atk = self._result_label.get_accessible()
+        if result_atk:
+            result_atk.set_name("Test result")
+        content.pack_start(self._result_label, False, False, 0)
+
+        self._note_label = Gtk.Label()
+        self._note_label.set_xalign(0)
+        self._note_label.set_line_wrap(True)
+        self._note_label.set_selectable(True)
+        self._note_label.set_margin_top(8)
+        note_atk = self._note_label.get_accessible()
+        if note_atk:
+            note_atk.set_name("Rule notes")
+        content.pack_start(self._note_label, False, False, 0)
+
+        for widget in (self._pattern_entry, self._replacement_entry, self._test_entry):
+            widget.connect("changed", self._refresh)
+        self._type_combo.connect("changed", self._refresh)
+        self._language_combo.connect("changed", self._refresh)
+        for widget in (self._case_switch, self._whole_switch):
+            widget.connect("notify::active", self._refresh)
+
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        self.add_button("OK", Gtk.ResponseType.OK)
+        self._ok_button = self.add_button("OK", Gtk.ResponseType.OK)
         self.set_default_response(Gtk.ResponseType.OK)
         self.connect("response", self._on_response)
+        self._refresh()
 
-    def _on_response(self, dialog, response_id):
+    def _current_entry(self):
+        return {
+            "type": self._type_combo.get_active_id() or "text",
+            "pattern": self._pattern_entry.get_text(),
+            "replacement": self._replacement_entry.get_text(),
+            "language": self._language_combo.get_active_id() or "",
+            "case_sensitive": self._case_switch.get_active(),
+            "whole_word": self._whole_switch.get_active(),
+            "enabled": True,
+            "comment": "",
+        }
+
+    def _refresh(self, *_args):
+        """Validate and show what the rule does, on every keystroke.
+
+        Only the cheap checks run here. The last of the three -- running the
+        pattern against inputs built to provoke runaway backtracking -- costs
+        a subprocess launch, so doing it per keystroke would stall the
+        dialog on every letter typed. It is scheduled instead, once typing
+        has stopped.
+        """
+        from . import speech_dictionary as sd
+        entry = self._current_entry()
+        is_text = entry["type"] == "text"
+        self._whole_switch.set_sensitive(is_text)
+        self._whole_label.set_sensitive(is_text)
+
+        ok, message = sd.validate(entry, deep=False)
+        self._ok_button.set_sensitive(ok)
+        self._schedule_deep_check(entry if ok else None)
+
+        notes = []
+        if not ok:
+            notes.append(message)
+        elif entry["type"] == "regex":
+            notes.append("Backslash 1 in the replacement stands for the first "
+                         "bracketed part of the pattern.")
+        self._note_label.set_text("  ".join(notes))
+
+        sample = self._test_entry.get_text()
+        if not sample:
+            self._result_label.set_text("Type something in Test with to see the result.")
+            return
+        if not ok:
+            self._result_label.set_text("The rule is not valid yet, so there is "
+                                        "nothing to test.")
+            return
+        result, _trace = sd.preview(sample, [entry], entry["language"] or None)
+        if result == sample:
+            self._result_label.set_text(f"No change: {result}")
+        else:
+            self._result_label.set_text(f"Result: {result}")
+
+    def _schedule_deep_check(self, entry):
+        """Run the slow safety check a moment after typing stops."""
+        if self._deep_timer is not None:
+            GLib.source_remove(self._deep_timer)
+            self._deep_timer = None
+        if entry is None or entry["type"] != "regex":
+            return
+        key = (entry["pattern"], entry["replacement"])
+        if key == self._deep_checked:
+            return
+        self._deep_timer = GLib.timeout_add(500, self._run_deep_check, key)
+
+    def _run_deep_check(self, key):
+        """Refuse a pattern that is unsafe to run, and say why."""
+        from . import speech_dictionary as sd
+        self._deep_timer = None
+        entry = self._current_entry()
+        if (entry["pattern"], entry["replacement"]) != key:
+            return False
+        self._deep_checked = key
+        ok, message = sd.validate(entry)
+        self._ok_button.set_sensitive(ok)
+        if not ok:
+            self._note_label.set_text(message)
+        return False
+
+    def _on_response(self, _dialog, response_id):
+        if self._deep_timer is not None:
+            GLib.source_remove(self._deep_timer)
+            self._deep_timer = None
         if response_id == Gtk.ResponseType.OK:
-            voice_name = self._voice_combo.get_active_id() or ""
-            voice_lang = self._lang_code
-            voice_dialect = ""
-            if voice_name:
-                all_voices, _ = _get_speech_dispatcher_voices()
-                for vn, vl, vv, bl in all_voices:
-                    if vn == voice_name:
-                        parts = vl.replace("_", "-").split("-")
-                        voice_lang = parts[0].lower()
-                        voice_dialect = parts[1] if len(parts) > 1 else ""
-                        break
-            self._result = {
-                "voice_name": voice_name,
-                "voice_lang": voice_lang,
-                "voice_dialect": voice_dialect,
-                "rate": self._rate_spin.get_value(),
-                "average_pitch": self._pitch_spin.get_value(),
-                "gain": self._gain_spin.get_value(),
-                "contraction_table": self._contraction_combo.get_active_id() or "",
-            }
+            self._result = self._current_entry()
         self.destroy()
 
     def get_result(self):
         return self._result
 
+
+class SpeechDictionaryDialog(Gtk.Dialog):
+    """The list of pronunciation rules, in the order they are applied."""
+
+    COL_ENABLED = 0
+    COL_KIND = 1
+    COL_PATTERN = 2
+    COL_REPLACEMENT = 3
+    COL_LANGUAGE = 4
+
+    def __init__(self, parent, languages=()):
+        super().__init__(
+            title="Speech Dictionary",
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+        )
+        self._languages = list(languages)
+        self.set_default_size(720, 480)
+        self.set_border_width(12)
+        atk_obj = self.get_accessible()
+        if atk_obj:
+            atk_obj.set_name("Speech dictionary")
+
+        content = self.get_content_area()
+
+        info = Gtk.Label(
+            label="Rules are applied in order, from the top. Orca's own "
+                  "pronunciation dictionary runs as well, and matches whole "
+                  "words only; these rules can match patterns and can be "
+                  "limited to one language.")
+        info.set_line_wrap(True)
+        info.set_xalign(0)
+        content.pack_start(info, False, False, 0)
+
+        self._store = Gtk.ListStore(bool, str, str, str, str)
+        self._view = Gtk.TreeView(model=self._store)
+        self._view.set_headers_visible(True)
+        view_atk = self._view.get_accessible()
+        if view_atk:
+            view_atk.set_name("Pronunciation rules")
+
+        toggle = Gtk.CellRendererToggle()
+        toggle.connect("toggled", self._on_enabled_toggled)
+        self._view.append_column(Gtk.TreeViewColumn("On", toggle, active=self.COL_ENABLED))
+        for title, column in (("Kind", self.COL_KIND), ("Replace", self.COL_PATTERN),
+                              ("With", self.COL_REPLACEMENT),
+                              ("Language", self.COL_LANGUAGE)):
+            renderer = Gtk.CellRendererText()
+            col = Gtk.TreeViewColumn(title, renderer, text=column)
+            col.set_resizable(True)
+            self._view.append_column(col)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+        scrolled.add(self._view)
+        content.pack_start(scrolled, True, True, 0)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        buttons.set_margin_top(8)
+        for label, handler, name in (
+            ("_Add...", self._on_add, "Add a pronunciation rule"),
+            ("_Edit...", self._on_edit, "Edit the selected rule"),
+            ("_Remove", self._on_remove, "Remove the selected rule"),
+            ("Move _Up", self._on_move_up, "Apply the selected rule earlier"),
+            ("Move _Down", self._on_move_down, "Apply the selected rule later"),
+        ):
+            button = Gtk.Button(label=label, use_underline=True)
+            button.connect("clicked", handler)
+            button_atk = button.get_accessible()
+            if button_atk:
+                button_atk.set_name(name)
+            buttons.pack_start(button, False, False, 0)
+        content.pack_start(buttons, False, False, 0)
+
+        self._entries = []
+        self._reload()
+
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+        self.connect("response", self._on_response)
+
+    def _reload(self):
+        from . import speech_dictionary as sd
+        self._entries = sd.get_entries()
+        self._refill()
+
+    def _refill(self, select=None):
+        self._store.clear()
+        kinds = dict(_RULE_TYPE_LABELS)
+        for entry in self._entries:
+            self._store.append([
+                bool(entry.get("enabled", True)),
+                kinds.get(entry.get("type"), "Text replacement"),
+                entry.get("pattern", ""),
+                entry.get("replacement", ""),
+                entry.get("language") or "All",
+            ])
+        if select is not None and 0 <= select < len(self._entries):
+            self._view.set_cursor(Gtk.TreePath.new_from_indices([select]))
+
+    def _selected_index(self):
+        model, it = self._view.get_selection().get_selected()
+        if it is None:
+            return None
+        return model.get_path(it).get_indices()[0]
+
+    def _on_enabled_toggled(self, _renderer, path):
+        index = Gtk.TreePath.new_from_string(path).get_indices()[0]
+        self._entries[index]["enabled"] = not self._entries[index].get("enabled", True)
+        self._refill(select=index)
+
+    def _on_add(self, _button):
+        dialog = SpeechRuleDialog(self, None, self._languages)
+        dialog.show_all()
+        dialog.run()
+        result = dialog.get_result()
+        if result:
+            self._entries.append(result)
+            self._refill(select=len(self._entries) - 1)
+
+    def _on_edit(self, _button):
+        index = self._selected_index()
+        if index is None:
+            return
+        dialog = SpeechRuleDialog(self, self._entries[index], self._languages)
+        dialog.show_all()
+        dialog.run()
+        result = dialog.get_result()
+        if result:
+            result["enabled"] = self._entries[index].get("enabled", True)
+            self._entries[index] = result
+            self._refill(select=index)
+
+    def _on_remove(self, _button):
+        index = self._selected_index()
+        if index is None:
+            return
+        del self._entries[index]
+        self._refill(select=min(index, len(self._entries) - 1))
+
+    def _move(self, offset):
+        index = self._selected_index()
+        if index is None:
+            return
+        target = index + offset
+        if not 0 <= target < len(self._entries):
+            return
+        self._entries[index], self._entries[target] = (
+            self._entries[target], self._entries[index])
+        self._refill(select=target)
+
+    def _on_move_up(self, _button):
+        self._move(-1)
+
+    def _on_move_down(self, _button):
+        self._move(1)
+
+    def _on_response(self, _dialog, response_id):
+        if response_id == Gtk.ResponseType.OK:
+            from . import speech_dictionary as sd
+            sd.save(self._entries)
+        self.destroy()
 
 # ---------------------------------------------------------------------------
 # Character Names editor dialog
@@ -496,8 +803,12 @@ class CharacterNamesDialog(Gtk.Dialog):
         self._builtin = builtin_friendly_names
         self._changed = False
 
-        from . import custom_names
-        self._custom_names = custom_names
+        # import_module(".x", __package__), not `from . import x`: as an
+        # Orca user extension this package is imported as
+        # orca_user_extension.<name> with no `orca_user_extension` parent
+        # ever created, and `from . import x` insists on importing it.
+        from importlib import import_module
+        self._custom_names = import_module(".custom_names", __package__)
         self._custom_names.load()
 
         content = self.get_content_area()
@@ -696,14 +1007,12 @@ class PolyglotSettingsWindow(Gtk.Window):
     Uses sidebar navigation + Gtk.Stack to match Orca v50 preferences style.
     """
 
-    def __init__(self, config, mapper, on_save=None):
+    def __init__(self, config, on_save=None):
         super().__init__(title="Polyglot Settings")
         self._config = config
-        self._mapper = mapper
         self._on_save = on_save
         self._lang_checks = {}
-        self._customize_buttons = {}
-        self._lang_settings_edits = {}
+        self._lang_table_combos = {}
         self._script_combos = {}
         self._app_checks = {}
 
@@ -824,9 +1133,13 @@ class PolyglotSettingsWindow(Gtk.Window):
             atk_name="Language detection mode",
             atk_desc=("Off: never switch language. Markup only: trust language "
                       "tags from documents and Orca, plus deterministic "
-                      "Unicode-script detection. Markup + text: also run "
-                      "statistical detection on plain text. Always: ignore "
-                      "markup hints and force statistical detection."))
+                      "Unicode-script detection -- word lists and statistical "
+                      "detection are both left out, so text in a language that "
+                      "shares the Latin alphabet is read in the default "
+                      "language unless it is tagged. Markup + text: also read "
+                      "the text itself, using word lists and then statistical "
+                      "detection. Always: ignore markup hints and read the "
+                      "text."))
         self._detection_mode_combo.append("off", "Off")
         self._detection_mode_combo.append("markup_only", "Markup only")
         self._detection_mode_combo.append("markup_text", "Markup + text")
@@ -899,6 +1212,18 @@ class PolyglotSettingsWindow(Gtk.Window):
                 "characters are pronounced in brief and verbose modes")
         page.pack_start(char_btn, False, False, 0)
 
+        dict_btn = Gtk.Button(label="Edit Speech Dictionary...")
+        dict_btn.set_halign(Gtk.Align.START)
+        dict_btn.set_margin_top(6)
+        dict_btn.connect("clicked", self._on_edit_speech_dictionary)
+        atk_dict = dict_btn.get_accessible()
+        if atk_dict:
+            atk_dict.set_name("Edit speech dictionary")
+            atk_dict.set_description(
+                "Open an editor for how words and patterns are pronounced, "
+                "including regular expressions and rules for a single language")
+        page.pack_start(dict_btn, False, False, 0)
+
         return page
 
     def _build_detection_page(self):
@@ -933,13 +1258,6 @@ class PolyglotSettingsWindow(Gtk.Window):
             atk_desc="Text with multiple languages is split and each segment spoken with the correct voice")
         mixed_listbox.add_row_with_widget(row, self._mixed_lang_switch)
 
-        row, self._pause_spin, _ = _create_spin_row(
-            "Switch _pause (seconds):", 0.0, 2.0, 0.1, digits=1,
-            value=self._config.language_switch_pause,
-            atk_name="Language switch pause duration",
-            atk_desc="Pause between language-switched segments (0 for no pause)")
-        mixed_listbox.add_row_with_widget(row, self._pause_spin)
-
         row, self._mixed_max_words_spin, _ = _create_spin_row(
             "_Max words for mixed-language detection:", 50, 5000, 50,
             value=self._config.mixed_max_words,
@@ -949,7 +1267,108 @@ class PolyglotSettingsWindow(Gtk.Window):
         mixed_listbox.add_row_with_widget(row, self._mixed_max_words_spin)
 
         page.pack_start(mixed_listbox, False, False, 0)
+
+        # Word lists. Appended rather than placed at the top so that the
+        # headings already on this page stay where they have always been.
+        page.pack_start(_create_section_heading("Word Lists"), False, False, 0)
+
+        dict_listbox = FocusManagedListBox(self.focus_sidebar)
+
+        row, self._dict_enabled_switch, _ = _create_switch_row(
+            "Use word _lists to detect language",
+            self._config.dictionary_enabled,
+            atk_name="Use word lists to detect language",
+            atk_desc="Decide the language by counting how many words belong to "
+                     "each language's word list. Needs lists for at least two "
+                     "languages; run fetch-dictionaries.sh to install them.")
+        dict_listbox.add_row_with_widget(row, self._dict_enabled_switch)
+
+        row, self._detection_order_combo, _ = _create_combo_row(
+            "Detection _order:",
+            atk_name="Detection order",
+            atk_desc=("Which kind of detection gets the first say. Script "
+                      "detection is deterministic and best when each script "
+                      "belongs to one language. Word lists come first when two "
+                      "languages share a script, such as Russian and Ukrainian. "
+                      "Whichever is first, a method that cannot decide passes "
+                      "the question to the next."))
+        for order, label in _DETECTION_ORDER_CHOICES:
+            self._detection_order_combo.append(",".join(order), label)
+        self._detection_order_combo.set_active_id(
+            ",".join(self._config.detection_order))
+        if self._detection_order_combo.get_active_id() is None:
+            self._detection_order_combo.set_active_id(
+                ",".join(_DETECTION_ORDER_CHOICES[0][0]))
+        dict_listbox.add_row_with_widget(row, self._detection_order_combo)
+
+        row, self._dict_min_words_spin, _ = _create_spin_row(
+            "Words _unique to one language:", 1, 10, 1,
+            value=self._config.dictionary_min_words,
+            atk_name="Words unique to one language",
+            atk_desc="How many words must belong to one language's list and no "
+                     "other before that language is chosen. Shared words such "
+                     "as 'Information' are ignored either way. Default 2.")
+        dict_listbox.add_row_with_widget(row, self._dict_min_words_spin)
+
+        row, self._dict_min_share_spin, _ = _create_spin_row(
+            "Minimum _share of those words:", 0.30, 1.00, 0.05, digits=2,
+            value=self._config.dictionary_min_share,
+            atk_name="Minimum share of unique words",
+            atk_desc="The winning language must hold at least this share of all "
+                     "the words found to be unique to one language, so text with "
+                     "even evidence for two languages is left undecided. "
+                     "Default 0.60.")
+        dict_listbox.add_row_with_widget(row, self._dict_min_share_spin)
+
+        row, self._dict_max_words_spin, _ = _create_spin_row(
+            "_Most common words to load:", 0, 200000, 5000,
+            value=self._config.dictionary_max_words,
+            atk_name="Most common words to load",
+            atk_desc="Word lists are ordered by how common each word is, so this "
+                     "keeps only the most common ones. 0 loads the whole list. "
+                     "Default 30000.")
+        dict_listbox.add_row_with_widget(row, self._dict_max_words_spin)
+
+        page.pack_start(dict_listbox, False, False, 0)
+        page.pack_start(self._create_dictionary_status_label(), False, False, 0)
         return page
+
+    def _create_dictionary_status_label(self):
+        """A read-only line naming the word lists that are actually installed.
+
+        The settings above are meaningless without lists on disk, and there
+        is nowhere else in the dialog that would say so.
+        """
+        label = Gtk.Label()
+        label.set_xalign(0)
+        label.set_line_wrap(True)
+        label.set_margin_top(6)
+        label.set_selectable(True)
+        installed = []
+        directory = "Polyglot's dictionaries directory"
+        try:
+            from .dictionary_detector import DictionaryDetector, default_directory
+            directory = default_directory()
+            installed = DictionaryDetector(
+                languages=self._config.enabled_languages,
+                max_entries=self._config.dictionary_max_words,
+            ).available_languages()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.debug(f"Polyglot: could not inspect word lists: {error}")
+        if len(installed) >= 2:
+            text = "Word lists installed for: " + ", ".join(installed) + "."
+        elif installed:
+            text = (f"Only one word list is installed ({installed[0]}). "
+                    "At least two are needed, since detection works by "
+                    "comparing them.")
+        else:
+            text = ("No word lists are installed, so this method is inactive. "
+                    f"Run fetch-dictionaries.sh to install them into {directory}.")
+        label.set_text(text)
+        atk_obj = label.get_accessible()
+        if atk_obj:
+            atk_obj.set_name("Word list status")
+        return label
 
     def _build_languages_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -959,7 +1378,7 @@ class PolyglotSettingsWindow(Gtk.Window):
 
         info_label = Gtk.Label(
             label="Select languages to detect. "
-                  "Use Customize to set voice, rate, pitch, and braille table."
+                  "Voices are configured in Orca's own Voice Sets preferences."
         )
         info_label.set_line_wrap(True)
         info_label.set_xalign(0)
@@ -985,13 +1404,34 @@ class PolyglotSettingsWindow(Gtk.Window):
             check.connect("toggled", self._on_lang_toggled, lang_code)
             self._lang_checks[lang_code] = check
 
-            customize_btn = Gtk.Button(label="Customize...")
-            customize_btn.set_sensitive(check.get_active())
-            customize_btn.connect("clicked", self._on_customize_clicked, lang_code)
-            self._customize_buttons[lang_code] = customize_btn
+            # The braille table is the one per-language setting Orca's voice
+            # sets do not cover, so it stays here -- inline rather than
+            # behind a Customize dialog, since it is now the only thing
+            # that dialog would have held.
+            table_label = Gtk.Label(label="_Contraction table:")
+            table_label.set_use_underline(True)
+            table_combo = Gtk.ComboBoxText()
+            table_label.set_mnemonic_widget(table_combo)
+            table_combo.append("", "(No change)")
+            for table_display, full_path in sorted(_get_contraction_tables().items()):
+                table_combo.append(full_path, table_display)
+            current = (self._config.language_settings.get(lang_code, {})
+                       .get("contraction_table", ""))
+            table_combo.set_active_id(current)
+            if table_combo.get_active_id() is None:
+                table_combo.set_active(0)
+            table_combo.set_sensitive(check.get_active())
+            combo_atk = table_combo.get_accessible()
+            if combo_atk:
+                combo_atk.set_name(f"Contraction table for {display}")
+                combo_atk.set_description(
+                    "The liblouis table used for contracted braille when this "
+                    "language is detected")
+            self._lang_table_combos[lang_code] = table_combo
 
             row_box.pack_start(check, True, True, 0)
-            row_box.pack_end(customize_btn, False, False, 0)
+            row_box.pack_end(table_combo, False, False, 0)
+            row_box.pack_end(table_label, False, False, 0)
             lang_box.pack_start(row_box, False, False, 0)
 
         scrolled.add(lang_box)
@@ -1116,20 +1556,15 @@ class PolyglotSettingsWindow(Gtk.Window):
     # --- Event handlers ---
 
     def _on_lang_toggled(self, check, lang_code):
-        btn = self._customize_buttons.get(lang_code)
-        if btn:
-            btn.set_sensitive(check.get_active())
+        combo = self._lang_table_combos.get(lang_code)
+        if combo:
+            combo.set_sensitive(check.get_active())
         self._update_default_combo()
 
-    def _on_customize_clicked(self, button, lang_code):
-        current = (self._lang_settings_edits.get(lang_code)
-                   or self._config.language_settings.get(lang_code, {}))
-        dialog = LanguageSettingsDialog(self, lang_code, current)
+    def _on_edit_speech_dictionary(self, _button):
+        dialog = SpeechDictionaryDialog(self, self._config.enabled_languages)
         dialog.show_all()
         dialog.run()
-        result = dialog.get_result()
-        if result is not None:
-            self._lang_settings_edits[lang_code] = result
 
     def _on_edit_char_names(self, button):
         from .speech_interceptor import _FRIENDLY_NAMES
@@ -1186,8 +1621,14 @@ class PolyglotSettingsWindow(Gtk.Window):
         # Detection
         self._config.switch_confidence = self._confidence_spin.get_value()
         self._config.enable_mixed_language = self._mixed_lang_switch.get_active()
-        self._config.language_switch_pause = self._pause_spin.get_value()
         self._config.mixed_max_words = int(self._mixed_max_words_spin.get_value())
+        self._config.dictionary_enabled = self._dict_enabled_switch.get_active()
+        order = self._detection_order_combo.get_active_id()
+        if order:
+            self._config.detection_order = order.split(",")
+        self._config.dictionary_min_words = int(self._dict_min_words_spin.get_value())
+        self._config.dictionary_min_share = self._dict_min_share_spin.get_value()
+        self._config.dictionary_max_words = int(self._dict_max_words_spin.get_value())
 
         # Languages
         enabled = []
@@ -1196,8 +1637,15 @@ class PolyglotSettingsWindow(Gtk.Window):
                 enabled.append(lang_code)
         self._config.enabled_languages = enabled
 
-        for lang_code, settings in self._lang_settings_edits.items():
-            self._config.language_settings[lang_code] = settings
+        # Braille tables, for the languages that are still ticked. The rest
+        # are dropped so an unticked language does not keep a stale table.
+        self._config.language_settings = {
+            lang_code: {
+                "contraction_table": self._lang_table_combos[lang_code].get_active_id() or ""
+            }
+            for lang_code in enabled
+            if lang_code in self._lang_table_combos
+        }
 
         # Script Detection
         script_map = {}
@@ -1224,8 +1672,8 @@ class PolyglotSettingsWindow(Gtk.Window):
 # Public API
 # ---------------------------------------------------------------------------
 
-def show_settings_dialog(config, mapper, on_save=None):
+def show_settings_dialog(config, on_save=None):
     """Show the settings window. Must be called from the GTK main thread."""
-    window = PolyglotSettingsWindow(config, mapper, on_save)
+    window = PolyglotSettingsWindow(config, on_save)
     window.show_all()
     return window

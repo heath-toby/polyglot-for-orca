@@ -1,14 +1,65 @@
-"""Two-tier language detection: Unicode script (fast) + Lingua (slow for Latin)."""
+"""Layered language detection: Unicode script, word lists, then Lingua.
 
+Three tiers, each cheaper and more explainable than the next:
+
+``script``
+    Unicode script of the characters. Deterministic -- Cyrillic really is
+    Cyrillic -- and the only tier that can answer from a single character.
+``dictionary``
+    How many words are in each language's word list, and how many are in
+    only one of them. See :mod:`dictionary_detector`. Costs microseconds
+    and can be explained by naming the words that decided it.
+``lingua``
+    The statistical model. Handles languages with no word list installed,
+    and short Latin text that the word lists cannot settle.
+
+The order is configurable, because which one should win depends on the
+languages in play. ``script`` first is right when each script maps to one
+language -- Cyrillic text is Russian, and no word list is going to improve
+on that. ``dictionary`` first is right when two enabled languages share a
+script, since Russian and Ukrainian are both Cyrillic and only the words
+can tell them apart.
+
+A tier that cannot answer passes the question down. If none of them can,
+the caller keeps the language it already had.
+"""
+
+import re
 import unicodedata
 from collections import Counter
-from functools import lru_cache
 
 # Sentinel "language" codes — not real spoken languages, just trigger
 # braille-table switches. They live in script_to_language but never in
 # enabled_languages, so detect()/detect_character() must allow them
 # through without the enabled-languages check.
 _BRAILLE_ONLY_SENTINELS = ("ipa", "unicode_braille")
+
+# Detection tiers, in the default order. "dictionary" is a no-op unless word
+# lists are installed, so this default is safe on a fresh install.
+TIER_SCRIPT = "script"
+TIER_DICTIONARY = "dictionary"
+TIER_LINGUA = "lingua"
+DEFAULT_DETECTION_ORDER = (TIER_SCRIPT, TIER_DICTIONARY, TIER_LINGUA)
+VALID_TIERS = DEFAULT_DETECTION_ORDER
+
+# Returned by a tier that found real evidence but not enough of it to switch
+# yet. It stops the chain -- a later tier guessing from the same text would
+# only be guessing worse -- and leaves the current language in place.
+_NO_SWITCH = object()
+
+# Below this many characters, text has no content to detect a language from
+# and the content-based tiers are skipped entirely. A single character is
+# the case that matters: the word lists decline on it, but Lingua will
+# happily name a language for one letter, and letters are shared between
+# languages, so the answer is close to a coin toss. Asked once per keypress
+# while arrowing along a line, that reads as the voice changing at random
+# from character to character. The script tier is unaffected -- it works on
+# one character by design, which is how Cyrillic is recognised.
+_MIN_CONTENT_CHARS = 3
+
+# How many Lingua answers one detector remembers. Cleared wholesale when
+# full, which for a lookaside cache is both cheap and good enough.
+_LINGUA_CACHE_SIZE = 128
 
 _LINGUA_AVAILABLE = False
 try:
@@ -161,8 +212,6 @@ def detect_script(text):
     return None
 
 
-import re
-
 # Sentence boundary splitter for chunked mixed-language detection.
 # Splits on .!? followed by whitespace, and on newlines (which often
 # delimit list items, log lines, or code that has no sentence punctuation).
@@ -228,7 +277,7 @@ class LanguageDetector:
 
     def __init__(self, enabled_languages, word_threshold, script_to_language,
                  default_language=None, switch_confidence=None,
-                 mixed_max_words=600):
+                 mixed_max_words=600, dictionaries=None, detection_order=None):
         self._enabled_languages = enabled_languages
         self._word_threshold = max(1, word_threshold)
         self._script_to_language = script_to_language
@@ -239,6 +288,15 @@ class LanguageDetector:
         self._lingua_detector = None
         self._lingua_langs = []
         self._mixed_detector = None  # lazy-built for detect_mixed()
+        # text -> (language, confidence). See
+        # _cached_lingua_detect_with_confidence for why this is not an
+        # lru_cache on the method.
+        self._lingua_cache = {}
+        # A DictionaryDetector, or None to leave that tier out.
+        self._dictionaries = dictionaries
+        self._detection_order = normalize_detection_order(detection_order)
+        # The last dictionary verdict, kept so the log can say why.
+        self._last_dictionary_verdict = None
 
         # Allow user override of confidence threshold
         if switch_confidence is not None:
@@ -282,45 +340,177 @@ class LanguageDetector:
         if not text or not text.strip():
             return self._current_language if fallback_to_current else None
 
-        # Tier 1: Script detection (fast path) — always runs.
-        # Braille-only sentinels (ipa, unicode_braille) aren't in
-        # enabled_languages but are valid signals — they just trigger a
-        # contraction-table switch in _switch_language without changing
-        # voice. Allow them through without the enabled check, and don't
-        # write _current_language for them (it stays whatever spoken
-        # language was active).
+        # Tokenised once and shared by both word-based tiers, however the
+        # order puts them.
+        natural = None
+        # Cleared per call so the log can never attribute an answer to a
+        # verdict from an earlier line that a different tier decided.
+        self._last_dictionary_verdict = None
+
+        for tier in self._detection_order:
+            result = None
+            if tier == TIER_SCRIPT:
+                result = self._detect_by_script(text, fallback_to_current)
+            elif not statistical or not self._has_content(text):
+                # Both word-based tiers guess from content rather than
+                # reading a declared language, so markup-only mode skips
+                # them -- and so does text with no content to go on.
+                continue
+            elif tier == TIER_DICTIONARY:
+                if self._dictionaries is None:
+                    continue
+                if natural is None:
+                    natural = self._natural_words(text)
+                result = self._detect_by_dictionary(natural)
+            elif tier == TIER_LINGUA:
+                if not self._lingua_detector:
+                    continue
+                if natural is None:
+                    natural = self._natural_words(text)
+                if not natural:
+                    continue
+                result = self._detect_with_lingua(" ".join(natural), len(natural))
+
+            if result is _NO_SWITCH:
+                break
+            if result is not None:
+                return result
+
+        return self._current_language if fallback_to_current else None
+
+    @staticmethod
+    def _has_content(text):
+        """True if text is long enough for a language to be guessed from it."""
+        return has_content(text)
+
+    def _detect_by_script(self, text, fallback_to_current):
+        """Tier: the Unicode script of the text. Returns a language or None.
+
+        Braille-only sentinels (ipa, unicode_braille) aren't in
+        enabled_languages but are valid signals — they just trigger a
+        contraction-table switch in _switch_language without changing
+        voice. Allow them through without the enabled check, and don't
+        write _current_language for them (it stays whatever spoken
+        language was active).
+        """
         script = detect_script(text)
-        if script:
-            lang = self._script_to_language.get(script)
-            if lang in _BRAILLE_ONLY_SENTINELS:
-                return lang
-            if lang and lang in self._enabled_languages:
-                if fallback_to_current:
-                    self._current_language = lang
-                    self._word_buffer.clear()
-                return lang
+        if not script:
+            return None
+        lang = self._script_to_language.get(script)
+        if lang in _BRAILLE_ONLY_SENTINELS:
+            return lang
+        if lang and lang in self._enabled_languages:
+            if fallback_to_current:
+                self._current_language = lang
+                self._word_buffer.clear()
+            return lang
+        return None
 
-        if not statistical:
-            return self._current_language if fallback_to_current else None
+    def _detect_by_dictionary(self, natural):
+        """Tier: word-list membership. A language, None, or _NO_SWITCH."""
+        if not natural:
+            return None
+        verdict = self._dictionaries.detect(natural, candidates=self._enabled_languages)
+        self._last_dictionary_verdict = verdict
+        if verdict.conclusive:
+            # matched, not considered: the stability rule should count the
+            # words that carried evidence, not the ones we failed to place.
+            return self._commit(verdict.language, verdict.matched, confident=True)
 
-        # Tier 2: Lingua detection (slow path, Latin scripts)
-        if self._lingua_detector:
-            # Strip non-letter characters (braille dots, symbols, etc.)
-            clean = "".join(c for c in text if unicodedata.category(c).startswith(("L", "Z")))
-            if clean.strip():
-                # Filter out technical noise (paths, flags, identifiers)
-                natural = _filter_natural_words(clean)
-                if natural:
-                    clean_text = " ".join(natural)
-                    return self._detect_with_lingua(clean_text, len(natural))
+        if verdict.leader:
+            # Too thin to conclude, but unambiguous: these words belong to
+            # one language's list and no other's. That is worth more than a
+            # statistical guess on the same text, which on single words is
+            # confidently wrong often enough to matter -- so claim the
+            # answer rather than letting Lingua have it. Still subject to
+            # the stability rule, so a lone word only nudges the buffer.
+            committed = self._commit(verdict.leader, verdict.matched, confident=True)
+            return committed if committed is not None else _NO_SWITCH
 
-        return self._current_language
+        return None
+
+    @staticmethod
+    def _natural_words(text):
+        """Tokenise text into likely natural-language words.
+
+        Strips non-letter characters (braille dots, symbols, …) and then
+        technical noise (paths, flags, identifiers).
+        """
+        clean = "".join(c for c in text if unicodedata.category(c).startswith(("L", "Z")))
+        if not clean.strip():
+            return []
+        return _filter_natural_words(clean)
+
+    def _commit(self, detected, word_count, confident=False):
+        """Apply the word-threshold stability rule to a detected language.
+
+        Returns the language to speak with, or None when the evidence is
+        too thin to switch yet. Shared by every tier that guesses from
+        content, so one knob governs how twitchy detection is.
+
+        ``confident`` marks evidence worth acting on from a short utterance
+        -- a word-list match, or Lingua above the switch threshold.
+        """
+        if detected == self._current_language:
+            self._word_buffer.clear()
+            return detected
+
+        # Coming home to the default language is cheap; leaving it is not.
+        # The threshold exists to stop a stray line dragging the voice off
+        # the language the user mostly reads -- it has no business making
+        # the way back just as slow. Without this, a single-word utterance
+        # needs a run of agreeing detections to return, so after one German
+        # line every short English utterance (typing echo above all, which
+        # arrives one word or one character at a time) keeps being read in
+        # German until four of them agree; character echo never recovers at
+        # all, having no content to detect from.
+        #
+        # Only on confident evidence, though. Letting any guess home in
+        # reads a German sentence word by word in English, because Lingua
+        # calls "Kaffee" English at 0.91.
+        if confident and self._default_language and detected == self._default_language:
+            self._current_language = detected
+            self._word_buffer.clear()
+            return detected
+
+        if word_count >= self._word_threshold:
+            self._current_language = detected
+            self._word_buffer.clear()
+            return detected
+
+        self._word_buffer.append(detected)
+        if len(self._word_buffer) >= self._word_threshold:
+            recent = self._word_buffer[-self._word_threshold:]
+            if all(lang == detected for lang in recent):
+                self._current_language = detected
+                self._word_buffer.clear()
+                return detected
+        return None
+
+    def dictionary_status(self):
+        """Return (language, word_count, source) per installed word list."""
+        if self._dictionaries is None:
+            return []
+        return self._dictionaries.describe()
+
+    @property
+    def detection_order(self):
+        return self._detection_order
+
+    @property
+    def last_dictionary_verdict(self):
+        """The most recent dictionary verdict, for logging. May be None."""
+        return self._last_dictionary_verdict
 
     def _detect_with_lingua(self, text, natural_word_count):
-        """Use Lingua for Latin-script language detection with confidence check."""
+        """Tier: the statistical model. Returns a language or None.
+
+        Returning None rather than the current language is what lets a
+        later tier have a go when the order puts Lingua before it.
+        """
         detected, confidence = self._cached_lingua_detect_with_confidence(text)
         if not detected:
-            return self._current_language
+            return None
 
         if detected == self._current_language:
             self._word_buffer.clear()
@@ -332,41 +522,49 @@ class LanguageDetector:
                 and detected != self._default_language
                 and self._current_language == self._default_language):
             if confidence < self._SWITCH_AWAY_CONFIDENCE:
-                return self._current_language
+                return None
             if natural_word_count < self._SWITCH_AWAY_MIN_WORDS:
+                # Too few words to trust on its own; only a run of
+                # agreeing detections may switch.
                 self._word_buffer.append(detected)
                 if len(self._word_buffer) >= self._word_threshold:
                     if all(lang == detected for lang in self._word_buffer[-self._word_threshold:]):
                         self._current_language = detected
                         self._word_buffer.clear()
                         return detected
-                return self._current_language
+                return None
 
-        # For multi-word text, switch if above threshold
-        if natural_word_count >= self._word_threshold:
-            self._current_language = detected
-            self._word_buffer.clear()
-            return detected
+        return self._commit(
+            detected, natural_word_count,
+            confident=confidence >= self._SWITCH_AWAY_CONFIDENCE,
+        )
 
-        # For short text, apply word threshold buffer
-        self._word_buffer.append(detected)
-        if len(self._word_buffer) >= self._word_threshold:
-            if all(lang == detected for lang in self._word_buffer[-self._word_threshold:]):
-                self._current_language = detected
-                self._word_buffer.clear()
-                return detected
-
-        return self._current_language
-
-    @lru_cache(maxsize=128)
     def _cached_lingua_detect_with_confidence(self, text):
-        """Cached Lingua detection with confidence score."""
+        """Lingua detection with confidence score, cached per detector.
+
+        The cache is an instance attribute rather than an ``lru_cache`` on
+        the method. A decorated method caches on ``(self, text)``, so it
+        holds a strong reference to every detector it has been called on --
+        and a detector owns a built Lingua model. Settings are re-read on
+        every change, each time building a new detector, so the decorated
+        form kept the old ones and their models alive for the life of the
+        process.
+        """
+        cached = self._lingua_cache.get(text)
+        if cached is not None:
+            return cached
+
         values = self._lingua_detector.compute_language_confidence_values(text)
         if values:
             best = values[0]
-            lang_code = _LINGUA_LANG_MAP.get(best.language)
-            return lang_code, best.value
-        return None, 0.0
+            result = (_LINGUA_LANG_MAP.get(best.language), best.value)
+        else:
+            result = (None, 0.0)
+
+        if len(self._lingua_cache) >= _LINGUA_CACHE_SIZE:
+            self._lingua_cache.clear()
+        self._lingua_cache[text] = result
+        return result
 
     def detect_character(self, char, fallback_to_current=True):
         """Detect language for a single character (character-by-character navigation).
@@ -451,6 +649,7 @@ class LanguageDetector:
                 if lang_code and segment_text.strip():
                     segments.append((segment_text, lang_code))
 
+            segments = self._validate_segments(segments)
             # Only return if we actually found multiple different languages
             if len(set(code for _, code in segments)) >= 2:
                 return segments
@@ -458,6 +657,46 @@ class LanguageDetector:
             pass
 
         return None
+
+    def _validate_segments(self, segments):
+        """Correct Lingua's segment languages against the word lists, and merge.
+
+        ``detect_multiple_languages_of`` is handed the raw text, noise and
+        all -- it has to be, since we need character offsets back -- and on
+        number-heavy prose it mislabels badly. "I have 1 apple 2 oranges 3
+        pears 4 plums and 5 bananas in the basket" comes back as German for
+        the first half and English for the second, with no German in it at
+        all.
+
+        A spurious language change is expensive: it switches voice
+        mid-sentence and splits one utterance into several. So each segment
+        is weighed against the word lists, which have the final say when
+        they are sure, and neighbours that then agree are merged back into
+        one segment.
+        """
+        if self._dictionaries is None:
+            return segments
+
+        corrected = []
+        for text, lang in segments:
+            natural = self._natural_words(text)
+            if natural:
+                verdict = self._dictionaries.detect(
+                    natural, candidates=self._enabled_languages)
+                decided = verdict.language or verdict.leader
+                if decided and decided != lang:
+                    lang = decided
+            corrected.append((text, lang))
+
+        merged = []
+        for text, lang in corrected:
+            if merged and merged[-1][1] == lang:
+                # The texts are consecutive slices of the original, so
+                # joining them reconstructs the span exactly.
+                merged[-1] = (merged[-1][0] + text, lang)
+            else:
+                merged.append((text, lang))
+        return merged
 
     def _detect_mixed_chunked(self, text):
         """Run mixed detection per sentence and concatenate the segments.
@@ -489,6 +728,7 @@ class LanguageDetector:
             except Exception:
                 continue
 
+        all_segments = self._validate_segments(all_segments)
         if len(set(code for _, code in all_segments)) >= 2:
             return all_segments
         return None
@@ -506,6 +746,37 @@ class LanguageDetector:
                 continue
             for i in range(0, len(words), _MIXED_HARD_CHUNK_WORDS):
                 yield " ".join(words[i:i + _MIXED_HARD_CHUNK_WORDS])
+
+
+def has_content(text):
+    """True if text is long enough for a language to be guessed from it.
+
+    Public because callers need to know whether a detection result means
+    anything: with no content, ``detect`` has nothing but the current
+    language to return, and a caller with better context of its own should
+    use that instead.
+    """
+    return bool(text) and len(text.strip()) >= _MIN_CONTENT_CHARS
+
+
+def normalize_detection_order(order):
+    """Return a usable tier order from whatever the settings hold.
+
+    Unknown names are dropped and missing tiers appended in their default
+    positions, so a hand-edited setting can neither disable a tier by
+    typo nor leave detection with nothing to try.
+    """
+    if not order:
+        return DEFAULT_DETECTION_ORDER
+    seen = []
+    for tier in order:
+        tier = str(tier).strip().lower()
+        if tier in VALID_TIERS and tier not in seen:
+            seen.append(tier)
+    for tier in DEFAULT_DETECTION_ORDER:
+        if tier not in seen:
+            seen.append(tier)
+    return tuple(seen)
 
 
 def is_lingua_available():

@@ -1,289 +1,152 @@
 #!/usr/bin/env bash
-# Polyglot for Orca — Installer
-# Installs the add-on into Orca's user data directory.
+# Polyglot for Orca -- Installer
+#
+# Installs Polyglot as an Orca 51 user extension, into
+# ~/.local/share/orca/extensions/, and approves it so Orca will load it.
+#
+# Only code goes in the extension package. The Python venv, custom
+# character names and the debug log live in Polyglot's data directory,
+# ~/.local/share/orca/polyglot/. That split is deliberate: Orca approves
+# an extension by hashing every file in its directory, so anything
+# written at runtime has to live elsewhere. It also means the venv --
+# whose scripts bake in an absolute path -- never has to be rebuilt for a
+# package move again.
+#
+# Re-running is safe. Because approval is by content hash, the script
+# re-approves on every run, which is what you want after editing.
 
 set -euo pipefail
 
 ADDON_NAME="polyglot"
-OLD_ADDON_NAME="orca_autoswitch"
 ORCA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/orca"
-ADDON_DIR="$ORCA_DIR/$ADDON_NAME"
-OLD_ADDON_DIR="$ORCA_DIR/$OLD_ADDON_NAME"
+EXTENSIONS_DIR="$ORCA_DIR/extensions"
+ADDON_DIR="$EXTENSIONS_DIR/$ADDON_NAME"
+DATA_DIR="$ORCA_DIR/$ADDON_NAME"
+VENV_DIR="$DATA_DIR/.venv"
 CUSTOMIZATIONS="$ORCA_DIR/orca-customizations.py"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_DIR="$SCRIPT_DIR/$ADDON_NAME"
 
-# --- Helpers ---
+LINGUA_PKG="lingua-language-detector>=2.0"
+
+BEGIN_MARKER="# --- polyglot begin ---"
+END_MARKER="# --- polyglot end ---"
+
+# Pre-extension install locations to carry user data across from.
+LEGACY_DIRS=("$ORCA_DIR/polyglot_v51" "$ORCA_DIR/polyglot_v50")
 
 info()  { echo "  [+] $*"; }
 warn()  { echo "  [!] $*"; }
 error() { echo "  [ERROR] $*" >&2; exit 1; }
 
-# --- Pre-flight checks ---
-
 echo ""
-echo "=== Polyglot for Orca — Installer ==="
+echo "=== Polyglot for Orca -- Installer ==="
 echo ""
 
-# Check that Orca is installed
-if ! python3 -c "import orca" 2>/dev/null; then
-    error "Orca screen reader not found. Please install Orca first."
+# Probe via extension_loader, not orca.extension: importing orca.extension
+# first hits a circular import inside Orca itself (live_region_presenter
+# imports it mid-initialisation). extension_loader pulls in command_manager
+# ahead of it, so this import order is the one that works.
+if ! python3 -c "import orca.extension_loader" 2>/dev/null; then
+    error "Orca 51 or later with extension support not found."
 fi
-info "Orca found."
+info "Orca with extension support found."
 
-# Check that Speech Dispatcher is available
-if ! python3 -c "import speechd" 2>/dev/null; then
-    warn "Speech Dispatcher Python bindings not found."
-    warn "Voice discovery will be limited. Install python-speechd if available."
-fi
+[ -d "$SOURCE_DIR" ] || error "Source directory '$SOURCE_DIR' not found."
+rm -rf "$SOURCE_DIR/__pycache__"
 
-# Check source files exist
-if [ ! -d "$SOURCE_DIR" ]; then
-    error "Source directory '$SOURCE_DIR' not found. Run this script from the extracted archive."
-fi
+# --- Data directory, and anything to rescue from an older install ---
 
-# --- Migration from old orca_autoswitch installation ---
+mkdir -p "$DATA_DIR"
 
-if [ -d "$OLD_ADDON_DIR" ] && [ ! -d "$ADDON_DIR" ]; then
-    info "Migrating from orca_autoswitch to polyglot..."
-    cp -a "$OLD_ADDON_DIR" "$ADDON_DIR"
-
-    # The venv's interpreter shebangs hardcode the old absolute path;
-    # let it be rebuilt under the new path further below.
-    rm -rf "$ADDON_DIR/.venv"
-
-    # Stray diagnostic / debug logs shouldn't migrate.
-    rm -f "$ADDON_DIR/markup-diag.log" "$ADDON_DIR/debug.log"
-
-    # Rename config file if it exists
-    if [ -f "$ADDON_DIR/autoswitch_config.json" ]; then
-        mv "$ADDON_DIR/autoswitch_config.json" "$ADDON_DIR/polyglot_config.json"
+for legacy in "${LEGACY_DIRS[@]}"; do
+    [ -d "$legacy" ] || continue
+    # Custom character names. The pre-extension code already read these
+    # from the data directory, so a copy sitting in a renamed add-on
+    # folder is one the add-on had stopped loading.
+    if [ -f "$legacy/custom_names.json" ] && [ ! -f "$DATA_DIR/custom_names.json" ]; then
+        cp "$legacy/custom_names.json" "$DATA_DIR/custom_names.json"
+        info "Recovered custom character names from $(basename "$legacy")."
     fi
-    if [ -f "$ADDON_DIR/autoswitch_config.json.migrated" ]; then
-        mv "$ADDON_DIR/autoswitch_config.json.migrated" "$ADDON_DIR/polyglot_config.json.migrated"
+    if [ -f "$legacy/polyglot_config.json" ] && [ ! -f "$DATA_DIR/polyglot_config.json" ]; then
+        cp "$legacy/polyglot_config.json" "$DATA_DIR/polyglot_config.json"
+        info "Recovered the legacy JSON config from $(basename "$legacy")."
     fi
+done
 
-    # Migrate GSettings data from old dconf path to new
-    if command -v dconf >/dev/null 2>&1; then
-        OLD_DCONF=$(dconf dump /org/gnome/orca/autoswitch/ 2>/dev/null || true)
-        if [ -n "$OLD_DCONF" ]; then
-            echo "$OLD_DCONF" | dconf load /org/gnome/orca/polyglot/ 2>/dev/null || true
-            info "GSettings data migrated."
-        fi
-    fi
+# --- The venv, in the data directory ---
 
-    info "Migration complete. Removing old installation..."
-    rm -rf "$OLD_ADDON_DIR"
-fi
-
-# --- Installation ---
-
-# Create the Orca data directory if needed
-mkdir -p "$ORCA_DIR"
-
-# Back up existing installation if present
-if [ -d "$ADDON_DIR" ]; then
-    # Preserve the user's config file
-    if [ -f "$ADDON_DIR/polyglot_config.json" ]; then
-        info "Backing up existing configuration..."
-        cp "$ADDON_DIR/polyglot_config.json" "/tmp/polyglot_config.json.bak"
-    fi
-    info "Removing previous installation..."
-    # Remove old Python files but keep .venv if it exists (saves re-downloading lingua)
-    find "$ADDON_DIR" -maxdepth 1 -name "*.py" -delete
-    find "$ADDON_DIR" -maxdepth 1 -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-fi
-
-# Copy add-on files
-info "Installing add-on files to $ADDON_DIR..."
-mkdir -p "$ADDON_DIR"
-cp "$SOURCE_DIR"/*.py "$ADDON_DIR/"
-
-# Restore config if we backed it up
-if [ -f "/tmp/polyglot_config.json.bak" ]; then
-    cp "/tmp/polyglot_config.json.bak" "$ADDON_DIR/polyglot_config.json"
-    rm -f "/tmp/polyglot_config.json.bak"
-    info "Configuration restored."
-fi
-
-# --- Remove old orca_autoswitch remnants ---
-
-if [ -d "$OLD_ADDON_DIR" ]; then
-    info "Removing old orca_autoswitch directory..."
-    rm -rf "$OLD_ADDON_DIR"
-fi
-
-# Remove old GSettings schema if present
-OLD_SCHEMA_FILE="org.gnome.Orca.AutoSwitch.gschema.xml"
-SCHEMA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/glib-2.0/schemas"
-if [ -f "$SCHEMA_DIR/$OLD_SCHEMA_FILE" ]; then
-    rm -f "$SCHEMA_DIR/$OLD_SCHEMA_FILE"
-    info "Removed old GSettings schema."
-fi
-
-# Clear old dconf settings
-if command -v dconf >/dev/null 2>&1; then
-    dconf reset -f /org/gnome/orca/autoswitch/ 2>/dev/null || true
-fi
-
-# --- Install GSettings schema ---
-
-SCHEMA_FILE="org.gnome.Orca.Polyglot.gschema.xml"
-
-if [ -f "$SOURCE_DIR/$SCHEMA_FILE" ]; then
-    info "Installing GSettings schema..."
-    mkdir -p "$SCHEMA_DIR"
-    cp "$SOURCE_DIR/$SCHEMA_FILE" "$SCHEMA_DIR/"
-    if command -v glib-compile-schemas >/dev/null 2>&1; then
-        glib-compile-schemas "$SCHEMA_DIR" 2>/dev/null && \
-            info "GSettings schema compiled." || \
-            warn "Could not compile GSettings schema. Settings will fall back to JSON."
-    else
-        warn "glib-compile-schemas not found. Settings will fall back to JSON."
-    fi
-else
-    warn "GSettings schema file not found. Settings will use JSON."
-fi
-
-# --- Set up orca-customizations.py ---
-
-LOADER_BLOCK='# --- polyglot begin ---
-import sys as _sys, os as _os, logging as _logging
-_polyglot_log = _logging.getLogger("polyglot")
-_orca_dir = _os.path.join(
-    _os.environ.get("XDG_DATA_HOME", _os.path.expanduser("~/.local/share")),
-    "orca"
-)
-if _orca_dir not in _sys.path:
-    _sys.path.insert(0, _orca_dir)
-try:
-    from polyglot import speech_interceptor
-    speech_interceptor.install()
-except Exception as _e:
-    _polyglot_log.error(f"Failed to load Polyglot: {_e}", exc_info=True)
-# --- polyglot end ---'
-
-if [ -f "$CUSTOMIZATIONS" ]; then
-    # Remove old orca-autoswitch loader block if present
-    if grep -q "orca-autoswitch begin" "$CUSTOMIZATIONS" 2>/dev/null; then
-        info "Removing old orca-autoswitch loader block..."
-        sed -i '/# --- orca-autoswitch begin ---/,/# --- orca-autoswitch end ---/d' "$CUSTOMIZATIONS"
-    fi
-
-    # Remove the new polyglot loader block if present (for re-installs)
-    if grep -q "polyglot begin" "$CUSTOMIZATIONS" 2>/dev/null; then
-        info "Removing previous Polyglot loader block..."
-        sed -i '/# --- polyglot begin ---/,/# --- polyglot end ---/d' "$CUSTOMIZATIONS"
-    fi
-
-    # Remove any old-style unmarked loader that imports orca_autoswitch
-    if grep -q "orca_autoswitch" "$CUSTOMIZATIONS" 2>/dev/null; then
-        info "Removing old-style loader..."
-        python3 -c "
-import re, sys
-with open(sys.argv[1]) as f:
-    content = f.read()
-lines = content.split('\n')
-clean = []
-skip = False
-for line in lines:
-    if 'auto-language-switch' in line.lower() and (line.strip().startswith('\"\"\"') or line.strip().startswith('#')):
-        continue
-    if 'orca_autoswitch' in line or 'orca-autoswitch' in line:
-        skip = True
-        continue
-    if skip and (line.strip().startswith('except') or line.strip().startswith('_log.')):
-        continue
-    skip = False
-    clean.append(line)
-result = '\n'.join(clean).strip()
-with open(sys.argv[1], 'w') as f:
-    f.write(result + '\n' if result else '')
-" "$CUSTOMIZATIONS"
-        info "Old-style loader removed."
-    fi
-
-    # If the file still has content, append; otherwise overwrite
-    if [ -s "$CUSTOMIZATIONS" ] && grep -q '[^[:space:]]' "$CUSTOMIZATIONS" 2>/dev/null; then
-        echo "" >> "$CUSTOMIZATIONS"
-        echo "$LOADER_BLOCK" >> "$CUSTOMIZATIONS"
-        info "Loader appended to existing orca-customizations.py."
-    else
-        echo "$LOADER_BLOCK" > "$CUSTOMIZATIONS"
-        info "Created orca-customizations.py with loader."
-    fi
-else
-    echo "$LOADER_BLOCK" > "$CUSTOMIZATIONS"
-    info "Created orca-customizations.py with loader."
-fi
-
-# Earlier installer versions removed the autoswitch loader block via sed,
-# which also removed an `import logging as _logging` line that some other
-# plugin loaders silently relied on. If we just edited the file and there
-# is no top-level `import logging`, prepend one defensively so blocks that
-# reference _logging in their except handlers don't NameError on failure.
-if [ -f "$CUSTOMIZATIONS" ] \
-        && ! grep -qE '^[[:space:]]*import[[:space:]]+logging' "$CUSTOMIZATIONS" \
-        && grep -q '_logging' "$CUSTOMIZATIONS"; then
-    info "Adding defensive 'import logging as _logging' at top..."
-    tmp=$(mktemp)
-    printf 'import logging as _logging\n\n' > "$tmp"
-    cat "$CUSTOMIZATIONS" >> "$tmp"
-    mv "$tmp" "$CUSTOMIZATIONS"
-fi
-
-# --- Install lingua (language detection library) ---
-
-info "Setting up language detection library..."
-
-VENV_DIR="$ADDON_DIR/.venv"
-LINGUA_PKG="lingua-language-detector>=2.0"
-
-# Create venv if it doesn't exist
 if [ ! -d "$VENV_DIR" ]; then
-    info "Creating virtual environment..."
-    python3 -m venv "$VENV_DIR" 2>/dev/null || {
-        warn "Could not create venv. Trying without venv..."
-        pip install --user "$LINGUA_PKG" 2>/dev/null || {
-            warn "Could not install lingua. The add-on will work with"
-            warn "script-based detection only (Cyrillic, Arabic, etc.)."
-            warn "Latin-script languages (English/German/French/etc.) will"
-            warn "not be auto-detected. Install manually with:"
-            warn "  pip install '$LINGUA_PKG'"
-        }
-    }
+    # A venv from an older install lives inside the add-on folder and its
+    # scripts hardcode that path, so copying it across would leave a
+    # broken pip. Build a fresh one instead.
+    info "Creating the Python environment (this may take a moment)..."
+    python3 -m venv "$VENV_DIR" || error "Could not create the venv at $VENV_DIR"
 fi
 
-if [ -d "$VENV_DIR" ]; then
-    info "Upgrading pip..."
-    "$VENV_DIR/bin/pip" install --quiet --upgrade pip 2>&1 || true
-    info "Installing/upgrading lingua (this may take a moment)..."
-    "$VENV_DIR/bin/pip" install --quiet --upgrade "$LINGUA_PKG" 2>&1 || {
-        warn "Lingua installation failed. Latin-script detection unavailable."
-    }
-    info "Installing/upgrading numpy and emoji..."
-    "$VENV_DIR/bin/pip" install --quiet --upgrade numpy emoji 2>&1 || {
-        warn "numpy/emoji installation failed. Some features may be unavailable."
+if [ -x "$VENV_DIR/bin/pip" ]; then
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+    info "Installing/upgrading lingua and emoji..."
+    "$VENV_DIR/bin/pip" install --quiet --upgrade "$LINGUA_PKG" emoji >/dev/null 2>&1 || {
+        warn "Package installation failed. Language detection may fall back to"
+        warn "script-based detection only. Retry with:"
+        warn "  $VENV_DIR/bin/pip install '$LINGUA_PKG' emoji"
     }
     if "$VENV_DIR/bin/python3" -c "import lingua" 2>/dev/null; then
-        LINGUA_VER=$("$VENV_DIR/bin/pip" show lingua-language-detector 2>/dev/null | grep Version | cut -d' ' -f2)
-        info "Lingua $LINGUA_VER installed successfully."
+        LINGUA_VER=$("$VENV_DIR/bin/pip" show lingua-language-detector 2>/dev/null \
+            | awk '/^Version:/{print $2}')
+        info "lingua ${LINGUA_VER:-installed} ready."
     else
-        warn "Lingua could not be loaded. Latin-script detection unavailable."
-        warn "Try: $VENV_DIR/bin/pip install '$LINGUA_PKG' numpy"
+        warn "lingua is not importable; statistical detection will be unavailable."
     fi
+else
+    warn "No pip in $VENV_DIR; skipping package installation."
 fi
 
-# --- Done ---
+# --- Word lists for the dictionary detection tier ---
+
+# Optional, and kept out of this script's critical path on purpose: the
+# lists are a download from a third party, so installing them is a separate
+# decision the user makes by running the fetcher.
+DICT_DIR="$DATA_DIR/dictionaries"
+dict_count=$(find "$DICT_DIR" -maxdepth 1 -name '*.txt' 2>/dev/null | wc -l)
+if [ "$dict_count" -ge 2 ]; then
+    info "Word lists installed for dictionary detection: $dict_count languages."
+else
+    info "No word lists yet. For dictionary-based detection, run:"
+    info "  ./fetch-dictionaries.sh"
+fi
+
+# --- The extension package: code only ---
+
+mkdir -p "$ADDON_DIR"
+# Remove files that no longer exist in the source, so the installed
+# package -- and therefore its approval hash -- matches the source.
+find "$ADDON_DIR" -maxdepth 1 -name '*.py' -delete
+rm -rf "$ADDON_DIR/__pycache__" "$ADDON_DIR/.venv"
+cp "$SOURCE_DIR"/*.py "$ADDON_DIR/"
+info "Installed extension package to $ADDON_DIR"
+
+if orca --approve-extension "$ADDON_NAME" >/dev/null 2>&1; then
+    info "Approved '$ADDON_NAME' with Orca."
+else
+    error "Could not approve the extension. Run: orca --approve-extension $ADDON_NAME"
+fi
+
+# Clean up after the pre-extension installer, if its block is still there.
+if [ -f "$CUSTOMIZATIONS" ] && grep -qF "$BEGIN_MARKER" "$CUSTOMIZATIONS" 2>/dev/null; then
+    sed -i "/${BEGIN_MARKER//\//\\/}/,/${END_MARKER//\//\\/}/d" "$CUSTOMIZATIONS"
+    info "Removed the obsolete Polyglot block from orca-customizations.py."
+fi
 
 echo ""
-echo "=== Installation complete! ==="
+echo "=== Installation complete ==="
 echo ""
-echo "  Restart Orca for changes to take effect."
-echo "  On first launch, Polyglot will auto-detect your installed"
-echo "  voices and configure language switching."
+echo "  Restart Orca to activate:"
+echo "    orca --replace &"
 echo ""
-echo "  Settings: press Orca+Shift+L at any time."
-echo "  Debug logging: ORCA_POLYGLOT_DEBUG=1 orca"
-echo "  Uninstall: run ./uninstall.sh"
+echo "  Settings: Orca+Shift+L. Data and venv: $DATA_DIR"
+echo "  Word lists (optional, for dictionary detection): ./fetch-dictionaries.sh"
+echo "  Settings from the old org.gnome.Orca.Polyglot schema are imported"
+echo "  on first run; nothing to do by hand."
 echo ""

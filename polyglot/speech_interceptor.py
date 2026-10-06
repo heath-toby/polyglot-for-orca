@@ -10,6 +10,49 @@ import sys
 
 log = logging.getLogger("polyglot")
 
+# Polyglot's data directory: the venv, the custom character names, the
+# debug log. Deliberately outside the extension package -- Orca approves
+# an extension by hashing every file in its directory and refuses to load
+# it if anything changed, so nothing written at runtime may live there.
+_DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+    "orca", "polyglot",
+)
+
+# Every monkey-patch we apply, as (owner, attribute, original, was_own).
+# Recorded so uninstall() can put Orca back exactly as it found it. This
+# matters for more than tidiness: the extension loader re-imports the
+# module on reload, so a fresh module would otherwise patch the already
+# patched functions and every utterance would be processed twice.
+_patched_targets = []
+
+
+def _patch(owner, attr, replacement):
+    """Install replacement on owner.attr, remembering what was there."""
+    try:
+        was_own = attr in vars(owner)
+    except TypeError:
+        was_own = True
+    _patched_targets.append((owner, attr, getattr(owner, attr), was_own))
+    setattr(owner, attr, replacement)
+
+
+def _unpatch_all():
+    """Restore every patched attribute, most recent first."""
+    while _patched_targets:
+        owner, attr, original, was_own = _patched_targets.pop()
+        try:
+            if was_own:
+                setattr(owner, attr, original)
+            else:
+                # It was inherited from the class; deleting the instance
+                # attribute we added restores the original lookup rather
+                # than pinning a bound method onto the instance.
+                delattr(owner, attr)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.warning(f"Polyglot: could not restore {attr}: {error}")
+
+
 # File-based debug log for diagnosing issues
 _debug_log = None
 _DEBUG_ENABLED = os.environ.get("ORCA_POLYGLOT_DEBUG", "").lower() in ("1", "true", "yes")
@@ -22,10 +65,8 @@ def _debug(msg):
         return
     try:
         if _debug_log is None:
-            log_path = os.path.join(
-                os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
-                "orca", "polyglot", "debug.log",
-            )
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            log_path = os.path.join(_DATA_DIR, "debug.log")
             _debug_log = open(log_path, "a")
         import time
         _debug_log.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
@@ -635,8 +676,11 @@ def _get_char_spoken_name(char, verbosity="verbose"):
 
     # Check user-defined custom names first (highest priority)
     try:
-        from . import custom_names as _custom_names_mod
-        custom = _custom_names_mod.get_name(char, verbosity)
+        # `from .x import y`, not `from . import x`: the loader never
+        # creates the `orca_user_extension` parent package, and the
+        # latter form makes Python try to import it.
+        from .custom_names import get_name as _custom_names_get_name
+        custom = _custom_names_get_name(char, verbosity)
         if custom:
             return custom
     except Exception:
@@ -730,18 +774,24 @@ def _expand_unpronounceable(text, verbosity="verbose"):
 # Global state
 _installed = False
 _detector = None
-_mapper = None
 _config = None
 _current_language = None
-_lang_acss_cache = {}
+# The languages Polyglot is configured for. Serves the membership test
+# that _lang_acss_cache used to: "is this a language we handle?"
+_configured_languages = set()
 _in_detection = False  # reentrancy guard
 
 
 def _add_venv_to_path():
-    """Add the bundled venv's site-packages to sys.path for lingua."""
-    venv_site = os.path.join(
-        os.path.dirname(__file__), ".venv", "lib"
-    )
+    """Add Polyglot's venv site-packages to sys.path for lingua.
+
+    The venv lives in Polyglot's data directory, not inside the extension
+    package. Keeping it out means the package holds only code, and -- more
+    importantly -- means the venv survives the package being moved or
+    reinstalled, which matters because its scripts bake in an absolute
+    path and have to be rebuilt whenever it moves.
+    """
+    venv_site = os.path.join(_DATA_DIR, ".venv", "lib")
     if not os.path.isdir(venv_site):
         return
     for entry in os.listdir(venv_site):
@@ -751,9 +801,14 @@ def _add_venv_to_path():
             break
 
 
-def install():
-    """Install the language-switching monkey-patches into Orca's speech system."""
-    global _installed, _detector, _mapper, _config, _current_language
+def install(config=None):
+    """Install the language-switching monkey-patches into Orca's speech system.
+
+    ``config`` is the Config the Extension owns, already bound to Orca's
+    per-extension settings store. It is optional only so that the older
+    orca-customizations.py entry point keeps working.
+    """
+    global _installed, _detector, _config, _current_language
 
     if _installed:
         return
@@ -761,33 +816,32 @@ def install():
     _add_venv_to_path()
     _init_emoji()
 
-    from . import custom_names as _custom_names_mod
-    _custom_names_mod.load()
+    from .custom_names import load as _custom_names_load
+    _custom_names_load()
+
+    from .speech_dictionary import load as _speech_dictionary_load
+    _speech_dictionary_load()
 
     from .config import Config
-    from .voice_mapper import VoiceMapper
     from .language_detector import LanguageDetector, is_lingua_available
 
-    _config = Config()
+    _config = config if config is not None else Config()
     first_run = _config.is_first_run
     _config.load()
 
-    _mapper = VoiceMapper()
+    # Hand any pre-2.2 per-language voices over to Orca's voice sets before
+    # the save below prunes those keys out of the store.
+    needs_save = _config.migrate_voice_settings_to_orca()
 
     if first_run:
-        _config.auto_configure_from_profiles(_mapper)
+        _config.auto_configure()
         _config.save()
-        log.info("Polyglot: first run, auto-configured from profiles")
+        log.info("Polyglot: first run, auto-configured from available voices")
     else:
-        # Sync with available voices on every startup — detects removed/changed
-        # voices and updates config without overwriting user customisations.
-        if _config.sync_from_voices(_mapper):
+        # Languages whose voices have gone are no longer worth detecting.
+        if _config.prune_unavailable_languages() or needs_save:
             _config.save()
-            log.info("Polyglot: synced config with available voices")
-
-    # Always register the keybinding so the user can open settings even when
-    # the add-on is disabled (otherwise there's no way to re-enable it).
-    _register_keybinding_deferred()
+            log.info("Polyglot: updated config for the available voices")
 
     # Always apply patches — they handle emoji (independent) and language
     # switching (checks _config.enabled and _detector internally).
@@ -810,11 +864,13 @@ def install():
         default_language=_config.default_language,
         switch_confidence=_config.switch_confidence,
         mixed_max_words=_config.mixed_max_words,
+        dictionaries=_build_dictionary_detector(),
+        detection_order=_config.detection_order,
     )
     _current_language = _config.default_language
     _detector.current_language = _current_language
 
-    _rebuild_acss_cache()
+    _rebuild_configured_languages()
     _installed = True
 
     lang_count = len(_config.enabled_languages)
@@ -822,6 +878,15 @@ def install():
     log.info(
         f"Polyglot: installed ({lang_count} languages, {lingua_status})"
     )
+    log.info(
+        "Polyglot: detection order is "
+        + " then ".join(_detector.detection_order)
+    )
+
+    # Word lists are read on first lookup, which would otherwise be the
+    # first thing Orca says. Reading them costs about 40 ms for three
+    # languages, so spend it on an idle callback instead.
+    _schedule_dictionary_warmup()
 
     if first_run:
         try:
@@ -834,8 +899,8 @@ def install():
 def _speak_first_run_notification(lang_count, lingua_status):
     """Speak a notification about the auto-configuration (called from GLib idle)."""
     try:
-        from orca import speech
-        speech.speak(
+        from orca import speech_presenter
+        speech_presenter.get_presenter().speak_message(
             f"Polyglot configured with {lang_count} languages, {lingua_status}.",
         )
     except Exception:
@@ -843,43 +908,27 @@ def _speak_first_run_notification(lang_count, lingua_status):
     return False
 
 
-def _rebuild_acss_cache():
-    """Build ACSS dicts for each configured language from language_settings."""
-    global _lang_acss_cache
-    _lang_acss_cache = {}
+def _rebuild_configured_languages():
+    """Refresh the set of languages Polyglot will switch to.
 
-    from orca.acss import ACSS
+    This used to build a full ACSS per language -- voice name, dialect,
+    rate, pitch and volume, read from Polyglot's own settings. Orca 51
+    supplies all of that itself from the matching voice set, so the only
+    thing worth remembering is which languages are enabled.
 
-    for lang_code, lang_settings in _config.language_settings.items():
-        if lang_code not in _config.enabled_languages:
-            continue
-
-        voice_name = lang_settings.get("voice_name", "")
-        voice_lang = lang_settings.get("voice_lang", lang_code)
-        voice_dialect = lang_settings.get("voice_dialect", "")
-        rate = lang_settings.get("rate")
-        pitch = lang_settings.get("average_pitch")
-        gain = lang_settings.get("gain")
-
-        if not voice_name:
-            continue
-
-        family = {
-            "name": voice_name,
-            "lang": voice_lang,
-            "dialect": voice_dialect,
-        }
-
-        acss = ACSS({ACSS.FAMILY: family})
-        if rate is not None:
-            acss[ACSS.RATE] = rate
-        if pitch is not None:
-            acss[ACSS.AVERAGE_PITCH] = pitch
-        if gain is not None:
-            acss[ACSS.GAIN] = gain
-
-        _lang_acss_cache[lang_code] = acss
-        log.info(f"Polyglot: cached ACSS for {lang_code}: {voice_name} rate={rate} pitch={pitch} gain={gain}")
+    One behaviour change falls out of that, for the better: a language used
+    to be skipped unless it had a voice name stored, so an enabled language
+    with no voice chosen silently never switched. Now ticking it is enough.
+    """
+    global _configured_languages, _focus_line_language, _line_language_cache
+    _configured_languages = set(_config.enabled_languages)
+    _fallback_families.clear()
+    _focus_line_language = None
+    _line_language_cache = None
+    log.info(
+        "Polyglot: configured languages: "
+        + (", ".join(sorted(_configured_languages)) or "(none)")
+    )
 
 
 def _switch_language(lang_code, also_braille: bool = True):
@@ -911,6 +960,17 @@ def _switch_language(lang_code, also_braille: bool = True):
             _set_contraction_table("/usr/share/liblouis/tables/unicode-braille.utb")
         return
 
+    if lang_code not in _configured_languages:
+        return
+
+    # Before either early return below, because neither of them used to be
+    # reached by it and the result was Orca announcing roles in the wrong
+    # language indefinitely: "Schaltfläche" instead of "button" long after
+    # the voice had gone back to English, which also fed that German
+    # straight back into detection. It is idempotent and cached, so calling
+    # it on every switch costs a comparison.
+    _set_orca_names_locale(lang_code)
+
     # If the language is already current AND the caller doesn't care
     # about braille, there's nothing to do. But when also_braille=True
     # the braille tables may still be lagging — speech-side calls with
@@ -918,9 +978,6 @@ def _switch_language(lang_code, also_braille: bool = True):
     # switch, so a follow-up update_braille for the same language
     # needs to fall through to _switch_braille_tables.
     if lang_code == _current_language and not also_braille:
-        return
-
-    if lang_code not in _lang_acss_cache:
         return
 
     if _in_detection:
@@ -943,9 +1000,6 @@ def _switch_language(lang_code, also_braille: bool = True):
         # language — symptom: German markup reads in English.
         if _detector is not None:
             _detector.current_language = lang_code
-        # Symbol-name locale is speech-side: it follows whichever language
-        # is currently being spoken, regardless of braille state.
-        _set_orca_names_locale(lang_code)
         if also_braille:
             lang_settings = _config.language_settings.get(lang_code, {})
             _switch_braille_tables(lang_settings)
@@ -1051,23 +1105,132 @@ def _switch_to_default_braille_tables() -> None:
 _focus_line_contraction_table: str | None = None
 _focus_line_brltty_text_table: str | None = None
 _focus_line_language: str | None = None
-_focus_line_names_locale: str | None = None
 
 
 def _record_focus_line_state() -> None:
-    """Pin the current state as the focus line's state.
+    """Pin the current braille tables as the focus line's tables.
 
     Called from _patched_update_braille after it has driven a language
     switch for the current line. The focus-line snapshot is what flash
-    save/restore uses, so it must not be perturbed by speech-time
-    language switches.
+    save/restore uses, so it must not be perturbed by speech-time language
+    switches -- speech for a flash message runs before the flash is
+    displayed, and may legitimately move _current_* to the flash's own
+    language.
+
+    It deliberately records nothing about the line's text or language for
+    anyone else to read. An earlier design did, and character announcements
+    took their language from it; every bug in that area came from the record
+    being out of step with what Orca was actually speaking. Characters now
+    ask the object instead -- see _context_language.
     """
     global _focus_line_contraction_table, _focus_line_brltty_text_table
-    global _focus_line_language, _focus_line_names_locale
+    global _focus_line_language
     _focus_line_contraction_table = _current_contraction_table
     _focus_line_brltty_text_table = _current_brltty_text_table
     _focus_line_language = _current_language
-    _focus_line_names_locale = _current_names_locale
+
+
+# Cache for the last container line we resolved a language for. Keyed on the
+# text itself, so it cannot go stale: a different line simply misses.
+_line_language_cache: tuple[str, str] | None = None
+
+
+def _container_line(obj, offset=None) -> str | None:
+    """The line of text ``obj`` is showing, or None.
+
+    None means the object is not a piece of text at all -- a button, a menu
+    item, a toolbar, a frame -- which is the signal that we are looking at
+    the window's own furniture rather than at content.
+
+    ``offset`` defaults to the caret. Braille passes its own, because
+    panning moves along a line without moving the caret.
+    """
+    try:
+        from orca.ax_object import AXObject
+        if not AXObject.supports_text(obj):
+            return None
+        from orca.ax_text import AXText
+        if offset is None:
+            offset = AXText.get_caret_offset(obj)
+        line = AXText.get_line_at_offset(obj, max(0, offset or 0))
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        _debug(f"_container_line: {type(error).__name__}: {error}")
+        return None
+    text = line[0] if line else None
+    return text if text and text.strip() else None
+
+
+def _language_of_line(text: str) -> str | None:
+    """Detect the language of a container line, remembering the last answer.
+
+    Two things here are load-bearing.
+
+    The detection mode is honoured, rather than the full detector being run
+    regardless. This is the path a space or a single character takes to its
+    language, and in markup-only mode it used to be the one place
+    statistical detection still happened -- so on a German line the letters
+    were read in the default language, having no script signal, while the
+    spaces between them were read in German. That is the character-by-
+    character flicker: not one language per character, but two paths to it
+    disagreeing.
+
+    Nothing is cached unless it was positively detected. Asking for the
+    current language as a fallback and then caching the answer against the
+    line's text would pin a volatile value to that line for good: read a
+    short line while German is current and it stays German for the rest of
+    the session, whatever is said in between.
+    """
+    global _line_language_cache
+    if _detector is None or _config is None:
+        return None
+    if _line_language_cache is not None and _line_language_cache[0] == text:
+        return _line_language_cache[1]
+    statistical = _config.detection_mode in ("markup_text", "always")
+    detected = _detector.detect(text, statistical=statistical,
+                                fallback_to_current=False)
+    if detected and detected in _configured_languages:
+        _line_language_cache = (text, detected)
+        _debug(f"_language_of_line: {detected} <- {text[:40]!r}")
+        return detected
+    return None
+
+
+def _context_language(obj, string) -> str | None:
+    """The language for a string with no content of its own.
+
+    A single character, a space, a two-letter label: nothing in the text
+    itself says what language it is, so the answer has to come from what it
+    sits in. Asking the object directly is what makes this reliable -- an
+    earlier design kept a remembered "current line" in module state, and
+    every bug in this area came from that record being out of step with
+    whatever Orca was actually speaking.
+
+    Three outcomes, from the structure rather than from guesswork:
+
+    * no object -- nothing to ask, so this is text being typed, and the
+      current language is right: it is what the accumulating words have
+      been teaching.
+    * an object that is not text -- a button, a menu item. Its label is
+      the window's own furniture, which is in the system language.
+    * an object that is text -- detect its line. Every character of a
+      German paragraph gets the same answer, spaces and punctuation
+      included, and it stays right however much unrelated speech happens
+      in between.
+    """
+    if _config is None:
+        return None
+    if obj is None:
+        return _current_language
+
+    line = _container_line(obj)
+    if line is None:
+        return _config.default_language
+    from .language_detector import has_content
+    if not has_content(line):
+        # A text object with nothing to go on: a one-word entry, an empty
+        # field. Still furniture as far as language goes.
+        return _config.default_language
+    return _language_of_line(line) or _current_language
 
 
 def _save_pre_flash_state() -> None:
@@ -1220,31 +1383,136 @@ def _set_brltty_text_table(lang_code):
         _brltty_conn = None
 
 
-def _get_lang_acss(lang_code):
-    """Get a COPY of the ACSS for a language, or None.
+# Orca's stand-in for "whatever the synthesiser defaults to". It is not a
+# voice Speech Dispatcher would recognise, so it must never be sent as one.
+_PLACEHOLDER_VOICE_NAMES = frozenset({"", "default default voice"})
 
-    Must return a copy because Orca's __resolve_acss() mutates the ACSS
-    in place (replacing the family dict with a VoiceFamily object).
-    If we returned the cached original, subsequent uses would have a
-    corrupted family dict.
+# lang -> family dict. Cleared whenever the configuration is rebuilt.
+_fallback_families = {}
+
+
+def _fallback_voice_family(lang_code):
+    """A concrete synthesis voice for a language, as a floor under voice sets.
+
+    Naming a voice here is not a duplication of Orca's voice sets -- it is
+    what makes them safe to rely on. Speech Dispatcher's synthesis voice is
+    connection state: ``_set_family`` sends ``set_synthesis_voice`` only
+    when the family carries a name, and never clears it. So an utterance
+    that names no voice is spoken by whatever voice the last one selected.
+    Send German, then English with the language alone, and the English is
+    read by the German voice -- ``set_language`` cannot rescue it, because a
+    single-language embedded voice ignores it.
+
+    Orca cannot close this itself: ``apply_voice_set`` has nothing to add
+    for a language with no voice set, and it deliberately never maps a
+    language onto the global set. So Polyglot supplies a name for every
+    language it switches to, and the user's voice set overrides it whenever
+    there is one -- ``apply_voice_overrides`` merges the set's family over
+    ours, so configuring a voice in Orca still wins.
     """
-    cached = _lang_acss_cache.get(lang_code)
-    if cached is None:
+    cached = _fallback_families.get(lang_code)
+    if cached is not None:
+        return cached
+
+    from orca.speechserver import VoiceFamily
+    from .available_voices import voices_for_language
+
+    family = {VoiceFamily.LANG: lang_code}
+    for name, full_lang, _variant in voices_for_language(lang_code):
+        if name.lower() in _PLACEHOLDER_VOICE_NAMES:
+            continue
+        family[VoiceFamily.NAME] = name
+        # Dialect comes from the same voice, never from another language:
+        # apply_voice_overrides only drops a stale dialect when the set
+        # changes the language, so a leaked "GB" would survive onto German.
+        dialect = ""
+        if "-" in full_lang:
+            dialect = full_lang.split("-", 1)[1]
+        elif "_" in full_lang:
+            dialect = full_lang.split("_", 1)[1]
+        if dialect:
+            family[VoiceFamily.DIALECT] = dialect
+        break
+    else:
+        log.warning(
+            f"Polyglot: no Speech Dispatcher voice found for {lang_code}; "
+            "it will be spoken by whichever voice is already active"
+        )
+
+    _fallback_families[lang_code] = family
+    return family
+
+
+def _boundary_marker_wanted() -> bool:
+    """Whether to mark a language boundary with a sentence break.
+
+    Polyglot used to carry its own setting for this, a pause in seconds
+    that was implemented as a sleep on Orca's main loop. The duration was
+    never the point and the sleep was indefensible, so the question is now
+    answered by Orca's own "insert pauses between utterances" preference --
+    which is what it was always asking -- and skipped at punctuation level
+    "all" so the full stop is not read aloud, exactly as Orca skips its own
+    pauses there.
+    """
+    try:
+        from orca import speech_manager
+        manager = speech_manager.get_manager()
+        if manager.get_punctuation_level() == "all":
+            return False
+        return manager.get_insert_pauses_between_utterances()
+    except Exception:  # pylint: disable=broad-exception-caught
+        return True
+
+
+def _end_with_boundary(text: str) -> str:
+    """End a segment with a sentence break, so the voice change lands cleanly.
+
+    Mirrors Orca's own pause handling, which appends "." to the text it is
+    about to flush. Skipped when the segment already ends in punctuation
+    that does the job.
+    """
+    stripped = text.rstrip()
+    if not stripped or stripped[-1] in ".,;:!?\u2026":
+        return text
+    return stripped + "."
+
+
+
+
+def _get_lang_acss(lang_code):
+    """Build the ACSS for a language, or None if we do not handle it.
+
+    Carries the language and a concrete voice for it. Everything else --
+    rate, pitch, inflection, volume, and the voice itself where the user
+    has configured one -- is filled in downstream by Orca's
+    ``apply_voice_set``, inside ``speech_presenter._speak_single``.
+
+    A fresh dict each time, because Orca's _resolve_acss() mutates the ACSS
+    in place, replacing the family dict with a VoiceFamily object.
+    """
+    if lang_code not in _configured_languages:
         return None
     from orca.acss import ACSS
-    return ACSS(cached)
+    return ACSS({ACSS.FAMILY: dict(_fallback_voice_family(lang_code))})
 
 
 def _apply_patches():
-    """Apply monkey-patches to Orca's speech module."""
+    """Apply monkey-patches to Orca's speech presenter singleton.
+
+    Orca 51 split the old `orca.speech` module into `speech_manager` (state)
+    and `speech_presenter` (public speaking API). Instead of module-level
+    function replacement, we now replace bound methods on the
+    `speech_presenter.get_presenter()` singleton — same net effect."""
     try:
-        from orca import speech
+        from orca import speech_presenter
     except ImportError as e:
-        log.error(f"Polyglot: cannot import orca.speech: {e}")
+        log.error(f"Polyglot: cannot import orca.speech_presenter: {e}")
         return
 
-    # Patch speech._speak — detect language and switch voice before speaking
-    _original_speak = speech._speak
+    _presenter = speech_presenter.get_presenter()
+
+    # Patch presenter._speak — detect language and switch voice before speaking
+    _original_speak = _presenter._speak
 
     def _is_app_ignored():
         """Check if the currently focused app is in the ignored list."""
@@ -1282,11 +1550,16 @@ def _apply_patches():
             _debug(f"_is_app_ignored ERROR {e}")
             return False
 
-    def _patched_speak(text, acss=None):
+    def _patched_speak(content, acss=None, obj=None):
         # Language detection and voice switching. _patched_speak has no
         # markup signal of its own; the upstream voice() patch already
         # applied the markup language (if any) to the ACSS. Here we run
         # our own text-based detection only when the mode allows it.
+        #
+        # Orca 51 added `obj` as a third parameter to SpeechPresenter._speak;
+        # we accept and forward it. `text` renamed to `content` to match
+        # master's signature.
+        text = content
         try:
             if (_config.enabled and _detector and text
                     and isinstance(text, str) and not _is_app_ignored()
@@ -1302,7 +1575,7 @@ def _apply_patches():
                 trusted_lang = None
                 if not _config.enable_mixed_language:
                     candidate = _acss_lang(acss)
-                    if candidate and candidate in _lang_acss_cache:
+                    if candidate and candidate in _configured_languages:
                         trusted_lang = candidate
                 if trusted_lang:
                     _debug(f"_speak: trust acss lang={trusted_lang} text={text[:40]!r}")
@@ -1317,7 +1590,7 @@ def _apply_patches():
                     # _patched_speak_character. Preserves any
                     # uppercase/hyperlink overrides voice() merged in.
                     explicit = _acss_lang(acss)
-                    if explicit not in _lang_acss_cache:
+                    if explicit not in _configured_languages:
                         explicit = None
                     if not explicit:
                         explicit = _detector.detect(
@@ -1354,13 +1627,8 @@ def _apply_patches():
                 segments = _detector.detect_mixed(text)
                 if segments:
                     _debug(f"_speak mixed: {len(segments)} segments")
-                    prev_lang = None
-                    pause = _config.language_switch_pause
+                    pending = []
                     for segment_text, lang_code in segments:
-                        # Insert pause when switching between languages
-                        if prev_lang is not None and lang_code != prev_lang and pause > 0:
-                            import time
-                            time.sleep(pause)
                         # Get the voice for this segment without switching
                         # braille tables — braille handles its own switching.
                         seg_acss = _get_lang_acss(lang_code) or acss
@@ -1370,8 +1638,29 @@ def _apply_patches():
                             seg_text = _expand_emojis(seg_text, lang_code)
                         if _config.speak_emoticons:
                             seg_text = _expand_emoticons(seg_text)
-                        _original_speak(seg_text, seg_acss)
-                        prev_lang = lang_code
+                        # Mark a language boundary the way Orca marks a
+                        # pause: end the previous segment with a full stop
+                        # and let the synthesiser's own sentence prosody
+                        # provide the gap. This used to be time.sleep() on
+                        # Orca's main loop, which froze keyboard, AT-SPI
+                        # and speech for the duration -- several times over
+                        # on a line that alternated. The separate speak
+                        # calls already produce an audible break; this just
+                        # makes it a little more definite.
+                        pending.append((seg_text, seg_acss, lang_code))
+
+                    # Speak with a one-segment delay, so a segment can be
+                    # given a sentence ending once we know the next one is
+                    # in a different language. Orca marks its own pauses
+                    # the same way -- appending to the text already queued,
+                    # so the break is spoken in that segment's voice rather
+                    # than opening the next one.
+                    mark = _boundary_marker_wanted()
+                    for index, (seg_text, seg_acss, lang_code) in enumerate(pending):
+                        if mark and index + 1 < len(pending):
+                            if pending[index + 1][2] != lang_code:
+                                seg_text = _end_with_boundary(seg_text)
+                        _original_speak(seg_text, seg_acss, obj)
                     return
         except Exception as e:
             _debug(f"_speak mixed: ERROR {e}")
@@ -1391,20 +1680,24 @@ def _apply_patches():
             _debug(f"_speak emoticon: ERROR {e}")
 
         try:
-            return _original_speak(text, acss)
+            return _original_speak(text, acss, obj)
         except Exception as e:
             _debug(f"_speak ORIGINAL CRASHED: {type(e).__name__}: {e}")
             import traceback
             _debug(traceback.format_exc())
 
-    speech._speak = _patched_speak
+    _patch(_presenter, "_speak", _patched_speak)
 
-    # Patch speech.speak (public API) — expand emojis in list content
-    # This catches text that arrives as lists from speech generators,
-    # which is the path used by line reading in apps like LibreOffice.
-    _original_public_speak = speech.speak
+    # Patch presenter.speak_message (public API) — expand emojis in list content.
+    # This catches text that arrives as lists from speech generators, which is
+    # the path used by line reading in apps like LibreOffice. Note: Orca 51
+    # renamed the old speech.speak → speak_message and changed the second arg
+    # from acss to voice_type. Polyglot uses this only for emoji expansion,
+    # not voice switching, so we just forward voice_type unchanged.
+    _original_public_speak = _presenter.speak_message
 
-    def _patched_public_speak(content, acss=None):
+    def _patched_public_speak(text, voice_type=None):
+        content = text
         try:
             if _config.speak_emojis and _emoji_available and isinstance(content, list):
                 lang = _current_language or _config.default_language
@@ -1416,69 +1709,73 @@ def _apply_patches():
                 content = _expand_emojis(content, lang)
         except Exception as e:
             _debug(f"speak emoji: ERROR {e}")
-        return _original_public_speak(content, acss)
+        if voice_type is None:
+            return _original_public_speak(content)
+        return _original_public_speak(content, voice_type)
 
-    speech.speak = _patched_public_speak
+    _patch(_presenter, "speak_message", _patched_public_speak)
 
-    # Patch speech.speak_character — use script detection for non-Latin chars
-    _original_speak_character = speech.speak_character
+    # Patch presenter.speak_character — use script detection for non-Latin chars.
+    # Orca 51 changed the second arg from acss to voice_from (a voice-name
+    # string) and added obj + language keyword args. Polyglot's original code
+    # inspected acss for a language tag; in the new API, `language` is passed
+    # directly, so we prefer it and fall back to script detection as before.
+    # We do not construct a voice_from ourselves — polyglot's language switch
+    # is handled by _switch_language() below, which updates the ACSS cache;
+    # voice selection then flows through _speak (which we also patched).
+    _original_speak_character = _presenter.speak_character
 
-    def _patched_speak_character(character, acss=None, cap_style=None):
+    def _patched_speak_character(character, voice_from="", cap_style=None, obj=None, language="", dialect=""):
         # Language resolution for character navigation. Same strict rule
         # as _patched_speak in markup-only mode: explicit signal → that
-        # language, otherwise default. The signal is acss.family.lang
-        # (which voice() resolved upstream from markup or obj-locale) or
-        # a non-Latin script in the character itself. Punctuation and
-        # plain Latin chars carry no signal — they go to default voice.
+        # language, otherwise default. The signal in Orca 51 is the
+        # `language` param (which upstream resolved from markup or obj-
+        # locale) or a non-Latin script in the character itself.
+        # Punctuation and plain Latin chars carry no signal — they go to
+        # default voice.
         try:
             if (_config.enabled and _detector and character
                     and isinstance(character, str) and not _is_app_ignored()
                     and _config.detection_mode != "off"):
                 mode = _config.detection_mode
-                if mode == "markup_only":
-                    explicit = _acss_lang(acss)
-                    if explicit not in _lang_acss_cache:
-                        explicit = None
-                    if not explicit:
-                        explicit = _detector.detect_character(
-                            character, fallback_to_current=False)
-                    if not explicit:
-                        explicit = _config.default_language
-                    # Chain: voice() markup → Unicode-script tier
-                    # (with current-language fallback, since per-char
-                    # detection can't run Lingua and Latin chars have
-                    # no script signal — falling back to current is
-                    # the only way to inherit line context) → default.
-                    if not explicit:
-                        explicit = _detector.detect_character(
-                            character, fallback_to_current=True)
-                    if not explicit:
-                        explicit = _config.default_language
-                    _debug(f"speak_char: char={character!r} explicit={explicit}")
+                # Chain, in order of how much the signal is worth:
+                #   1. the language Orca resolved from markup, except in
+                #      "always" mode, which ignores markup by definition;
+                #   2. the character's own Unicode script -- a Cyrillic
+                #      letter is Russian even in the middle of a German
+                #      line, so this outranks the line;
+                #   3. the language of the line the character is in;
+                #   4. the current language, then the default.
+                explicit = None
+                if mode != "always":
+                    # Orca may hand us "en-GB" or "de_DE"; collapse to "de".
+                    hinted = _normalize_lang_code(language)
+                    if hinted in _configured_languages:
+                        explicit = hinted
+                if not explicit:
+                    explicit = _detector.detect_character(
+                        character, fallback_to_current=False)
+                if not explicit:
+                    explicit = _context_language(obj, character)
+                if not explicit:
+                    explicit = _current_language or _config.default_language
+                _debug(f"speak_char: char={character!r} lang={explicit}")
+                if explicit:
                     _switch_language(explicit)
-                    if acss is None:
-                        lang_acss = _get_lang_acss(explicit)
-                        if lang_acss:
-                            acss = lang_acss
-                else:
-                    detected = _detector.detect_character(character)
-                    _debug(f"speak_char: char={character!r} detected={detected}")
-                    if detected:
-                        _switch_language(detected)
-                        if acss is None:
-                            lang_acss = _get_lang_acss(detected)
-                            if lang_acss:
-                                acss = lang_acss
         except Exception as e:
             _debug(f"speak_char lang: ERROR {e}")
 
-        # Emoji expansion for single characters (independent)
+        # Emoji expansion for single characters (independent). Routing via
+        # _speak (the internal method) speaks the whole emoji name as a
+        # phrase — using speak_character here would treat each letter
+        # individually, which is not what we want.
         try:
             if _config.speak_emojis and character and isinstance(character, str):
                 emoji_name = _expand_emoji_char(character, _current_language or _config.default_language)
                 if emoji_name:
                     _debug(f"speak_char: emoji -> {emoji_name!r}")
-                    return _original_speak(emoji_name, acss)
+                    return _original_speak(
+                        emoji_name, _get_lang_acss(_current_language), obj)
         except Exception as e:
             _debug(f"speak_char emoji: ERROR {e}")
 
@@ -1492,22 +1789,30 @@ def _apply_patches():
                     return
                 if char_name:
                     _debug(f"speak_char: unicode -> {char_name!r}")
-                    return _original_speak(char_name, acss)
+                    # Named characters are spoken as words, so they need the
+                    # language too; acss=None would get the global voice.
+                    return _original_speak(
+                        char_name, _get_lang_acss(_current_language), obj)
         except Exception as e:
             _debug(f"speak_char unicode: ERROR {e}")
 
         try:
-            return _original_speak_character(character, acss, cap_style=cap_style)
+            return _original_speak_character(
+                character, voice_from=voice_from, cap_style=cap_style,
+                obj=obj, language=language, dialect=dialect,
+            )
         except Exception as e:
             _debug(f"speak_char ORIGINAL CRASHED: {type(e).__name__}: {e}")
             import traceback
             _debug(traceback.format_exc())
 
-    speech.speak_character = _patched_speak_character
+    _patch(_presenter, "speak_character", _patched_speak_character)
 
-    # Patch speech.say_all — expand emojis in the utterance iterator
-    # say_all bypasses _speak entirely, going directly to the speech server
-    _original_say_all = speech.say_all
+
+    # Patch presenter.say_all — expand emojis in the utterance iterator.
+    # say_all bypasses _speak entirely, going directly to the speech server.
+    # Signature unchanged in Orca 51.
+    _original_say_all = _presenter.say_all
 
     def _patched_say_all(utterance_iterator, progress_callback):
         if _config and _config.speak_emojis and _emoji_available:
@@ -1525,7 +1830,7 @@ def _apply_patches():
         except Exception as e:
             _debug(f"say_all CRASHED: {type(e).__name__}: {e}")
 
-    speech.say_all = _patched_say_all
+    _patch(_presenter, "say_all", _patched_say_all)
 
     # Patch speech_generator.SpeechGenerator.voice to use language info
     try:
@@ -1586,8 +1891,35 @@ def _apply_patches():
                                 language = _config.default_language
                         else:
                             statistical = mode in ("markup_text", "always")
+                            # Without content, detect() has nothing to
+                            # return but the language already in use, which
+                            # would mask the context handling just below --
+                            # and that context knows more than "whatever
+                            # was last spoken". So ask for a plain no.
+                            from .language_detector import has_content
                             language = _detector.detect(
-                                string, statistical=statistical)
+                                string, statistical=statistical,
+                                fallback_to_current=has_content(string))
+                    if not language and isinstance(string, str):
+                        # Nothing was detected, which for a single character
+                        # is the correct outcome -- it has no content to
+                        # detect from -- but the voice still has to be
+                        # tagged with a language, or Orca resolves it from
+                        # the markup it was given, finds none, and uses the
+                        # global voice. That is why spaces and punctuation
+                        # on a German line were announced in English: the
+                        # name a character is given comes from Speech
+                        # Dispatcher's symbol table for whichever language
+                        # the voice is set to. So fall back to whatever
+                        # context there is, markup first: with nothing to
+                        # detect from there is no detection for markup to
+                        # be preferred over, so it is consulted even in
+                        # "always" mode. That mode means "do not trust
+                        # markup over our own reading of the text", not
+                        # "ignore it when we have no reading at all", and
+                        # it is what gets a two-letter button in an English
+                        # dialog announced in English.
+                        language = _context_language(args.get("obj"), string)
                     if language:
                         _switch_language(language, also_braille=False)
                         lang_acss = _get_lang_acss(language)
@@ -1624,7 +1956,7 @@ def _apply_patches():
                 _debug(traceback.format_exc())
                 return []
 
-        sg.SpeechGenerator.voice = _patched_voice
+        _patch(sg.SpeechGenerator, "voice", _patched_voice)
     except Exception as e:
         log.warning(f"Polyglot: could not patch speech_generator.voice: {e}")
 
@@ -1637,6 +1969,20 @@ def _apply_patches():
         _original_adjust = _presenter.adjust_for_presentation
 
         def _patched_adjust(obj, text, start_offset=None):
+            # The user's speech dictionary runs first, on the text as it
+            # stands. It has to be before the original: Orca's
+            # adjust_for_presentation verbalises punctuation by padding every
+            # symbol with spaces, which would turn "#5" into " # 5" and stop
+            # a pattern like #(\d+) ever matching. Running before the
+            # Unicode expansion below is deliberate too, so a rule can match
+            # the character itself rather than the name it is about to be
+            # given.
+            try:
+                if text and isinstance(text, str) and not _is_app_ignored():
+                    from .speech_dictionary import apply as _apply_dictionary
+                    text = _apply_dictionary(text, _current_language)
+            except Exception as e:
+                _debug(f"adjust_for_presentation dictionary: ERROR {e}")
             try:
                 verbosity = _config.unicode_verbosity
                 if verbosity != "off" and text and isinstance(text, str):
@@ -1645,7 +1991,7 @@ def _apply_patches():
                 _debug(f"adjust_for_presentation: ERROR {e}")
             return _original_adjust(obj, text, start_offset)
 
-        _presenter.adjust_for_presentation = _patched_adjust
+        _patch(_presenter, "adjust_for_presentation", _patched_adjust)
     except Exception as e:
         log.warning(f"Polyglot: could not patch adjust_for_presentation: {e}")
 
@@ -1664,41 +2010,49 @@ def _apply_patches():
                 mode = _config.detection_mode if _config else "markup_text"
                 if (_config.enabled and _detector and obj is not None
                         and not _is_app_ignored() and mode != "off"):
-                    from orca.ax_text import AXText
-                    offset = args.get("offset")
-                    if offset is None:
-                        offset = AXText.get_caret_offset(obj)
-                    line = AXText.get_line_at_offset(obj, offset)
-                    if line and line[0]:
-                        text = line[0]
-                        if isinstance(text, str) and text.strip():
-                            detected = None
-                            # Prefer obj-locale (markup signal) in non-always modes
-                            if mode != "always":
-                                try:
-                                    from orca.ax_object import AXObject
-                                    detected = _normalize_lang_code(
-                                        AXObject.get_locale(obj))
-                                except Exception:
-                                    pass
-                            if not detected:
-                                if mode == "markup_only":
-                                    detected = _detector.detect(
-                                        text, statistical=False,
-                                        fallback_to_current=False)
-                                    if not detected:
-                                        detected = _config.default_language
-                                else:
-                                    statistical = mode in ("markup_text", "always")
-                                    detected = _detector.detect(
-                                        text, statistical=statistical)
-                            if detected:
-                                _debug(f"update_braille: detected={detected}")
-                                _switch_language(detected)
-                                # Pin this as the focus-line state so the
-                                # flash hook has a clean snapshot
-                                # regardless of any speech-time mutations.
-                                _record_focus_line_state()
+                    # Resolved the same way the speech path resolves it,
+                    # which gates on the object actually being text. It was
+                    # previously asked for a line from whatever it was
+                    # handed -- a frame, a label -- and the English it got
+                    # back from those was why the contraction table was
+                    # switched to and fro several times per focus change:
+                    # inside gedit, on a German document, this logged
+                    # en, de, en, de in the space of a second.
+                    text = _container_line(obj, args.get("offset"))
+                    if text:
+                        detected = None
+                        # Prefer obj-locale (markup signal) in non-always modes
+                        if mode != "always":
+                            try:
+                                from orca.ax_object import AXObject
+                                detected = _normalize_lang_code(
+                                    AXObject.get_locale(obj))
+                            except Exception:
+                                pass
+                        if not detected:
+                            if mode == "markup_only":
+                                detected = _detector.detect(
+                                    text, statistical=False,
+                                    fallback_to_current=False)
+                                if not detected:
+                                    detected = _config.default_language
+                            elif mode in ("markup_text", "always"):
+                                # Cached per line text, so the repeated
+                                # calls Orca makes for one event cost a
+                                # string comparison rather than a fresh
+                                # detection and a churned word buffer.
+                                detected = _language_of_line(text)
+                            else:
+                                detected = _detector.detect(text)
+                        if detected:
+                            _debug(f"update_braille: detected={detected}")
+                            _switch_language(detected)
+                            # Pin this as the focus-line state so the
+                            # flash hook has a clean snapshot
+                            # regardless of any speech-time mutations,
+                            # and so character announcements within
+                            # this line can read its language.
+                            _record_focus_line_state()
             except Exception as e:
                 _debug(f"update_braille pre: ERROR {type(e).__name__}: {e}")
 
@@ -1710,7 +2064,7 @@ def _apply_patches():
             except Exception as e:
                 _debug(f"update_braille ORIGINAL CRASHED: {type(e).__name__}: {e}")
 
-        DefaultScript.update_braille = _patched_update_braille
+        _patch(DefaultScript, "update_braille", _patched_update_braille)
     except Exception as e:
         log.warning(f"Polyglot: could not patch update_braille: {e}")
 
@@ -1766,67 +2120,83 @@ def _apply_patches():
                 _debug(f"kill_flash pre: ERROR {e}")
             return _original_kill_flash(restore_saved)
 
-        braille.display_message = _patched_display_message
-        braille._flash_callback = _patched_flash_callback
-        braille.kill_flash = _patched_kill_flash
+        _patch(braille, "display_message", _patched_display_message)
+        _patch(braille, "_flash_callback", _patched_flash_callback)
+        _patch(braille, "kill_flash", _patched_kill_flash)
     except Exception as e:
         log.warning(f"Polyglot: could not patch braille flash lifecycle: {e}")
 
 
 # --- Keybinding registration ---
 
-def _register_keybinding_deferred():
-    """Schedule keybinding registration after Orca is fully initialized."""
-    try:
-        from gi.repository import GLib
-        GLib.idle_add(_register_keybinding)
-    except Exception as e:
-        log.warning(f"Polyglot: could not schedule keybinding: {e}")
+def uninstall():
+    """Remove every monkey-patch and reset module state.
+
+    Called from the Extension's on_disabled / on_shutdown hooks, so that
+    disabling Polyglot in Orca's preferences actually stops it and a
+    reload does not stack a second set of patches on the first.
+    """
+    global _installed, _detector, _config, _current_language
+    global _current_names_locale, _line_language_cache, _in_flash
+
+    if not _installed:
+        return
+
+    _unpatch_all()
+    _restore_orca_state()
+
+    _installed = False
+    _detector = None
+    _config = None
+    _current_language = None
+    _current_names_locale = None
+    _line_language_cache = None
+    _in_flash = False
+    _fallback_families.clear()
+    log.info("Polyglot: uninstalled")
 
 
-_keybinding_registered = False
+def _restore_orca_state():
+    """Undo the things Polyglot changed that are not monkey-patches.
 
-def _register_keybinding():
-    """Register the Orca+Shift+L keybinding for the settings dialog."""
-    global _keybinding_registered
-    if _keybinding_registered:
-        return False
+    Removing the patches stops Polyglot acting, but three pieces of state
+    it has already written would otherwise survive it: Orca's locale for
+    role and symbol names, the liblouis contraction table, and the BRLTTY
+    text table. Left behind, disabling Polyglot would leave Orca saying
+    "Schaltflache" and rendering German braille with nothing running to
+    explain it. The brlapi connection is closed for the same reason -- a
+    disabled extension should not be holding one open.
+    """
+    global _brltty_conn
 
-    try:
-        from orca import keybindings
-        from orca import command_manager
-        from orca import orca_modifier_manager
+    if _current_names_locale is not None:
+        try:
+            from orca import orca_i18n
+            # No argument is Orca's own "use the environment's locale":
+            # setModuleLocale asks gettext for languages=[None], which
+            # raises, and the except branch installs the plain gettext
+            # functions. That is the state before we interfered.
+            orca_i18n.setLocaleForNames()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.debug(f"Polyglot: could not restore the names locale: {error}")
 
-        kb = keybindings.KeyBinding("l", keybindings.ORCA_SHIFT_MODIFIER_MASK)
-        cmd = command_manager.KeyboardCommand(
-            "polyglotSettingsHandler",
-            _open_settings_dialog,
-            "Polyglot",
-            "Opens the Polyglot settings dialog",
-            desktop_keybinding=kb,
-            laptop_keybinding=kb,
-        )
+    default_lang = getattr(_config, "default_language", None) if _config else None
+    if default_lang:
+        try:
+            _switch_to_default_braille_tables()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.debug(f"Polyglot: could not restore the braille tables: {error}")
 
-        mgr = command_manager.get_manager()
-        mgr.add_command(cmd)
-
-        # Add key grabs so the binding is active immediately
-        active_kb = cmd.get_keybinding()
-        if active_kb:
-            orca_modifiers = orca_modifier_manager.get_manager().get_orca_modifier_keys()
-            active_kb.add_grabs(orca_modifiers)
-
-        _keybinding_registered = True
-        log.info("Polyglot: keybinding registered via CommandManager")
-
-    except Exception as e:
-        log.warning(f"Polyglot: could not register keybinding: {e}")
-
-    return False
+    if _brltty_conn is not None:
+        try:
+            _brltty_conn.closeConnection()
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        _brltty_conn = None
 
 
-def _open_settings_dialog(script, event=None):
-    """Handler for the Orca+Shift+L keybinding."""
+def open_settings():
+    """Command handler for Orca+Shift+L. Opens the hand-written dialog."""
     try:
         from gi.repository import GLib
         GLib.idle_add(_show_settings_ui)
@@ -1839,12 +2209,12 @@ def _show_settings_ui():
     """Show the settings UI (must be called from GTK main thread)."""
     try:
         from .config_ui import show_settings_dialog
-        show_settings_dialog(_config, _mapper, on_save=reload_config)
+        show_settings_dialog(_config, on_save=reload_config)
     except Exception as e:
         log.error(f"Polyglot: could not show settings dialog: {e}")
         try:
-            from orca import speech
-            speech.speak(f"Error opening language switch settings: {e}")
+            from orca import speech_presenter
+            speech_presenter.get_presenter().speak_message(f"Error opening language switch settings: {e}")
         except Exception:
             pass
     return False
@@ -1852,14 +2222,67 @@ def _show_settings_ui():
 
 # --- Public API ---
 
-def get_config():
-    return _config
+def _schedule_dictionary_warmup():
+    """Read the word lists on an idle callback rather than mid-utterance."""
+    if _detector is None:
+        return
+    try:
+        from gi.repository import GLib
+    except Exception:  # pylint: disable=broad-exception-caught
+        return
 
-def get_detector():
-    return _detector
+    def warm():
+        try:
+            # Returns [] when the tier is not in use, which makes this a
+            # no-op rather than something needing its own guard.
+            loaded = _detector.dictionary_status()
+            if loaded:
+                log.info(
+                    "Polyglot: word lists warmed -- "
+                    + ", ".join(f"{lang} ({count})" for lang, count, _ in loaded)
+                )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.debug(f"Polyglot: word list warm-up skipped: {error}")
+        return False
 
-def get_mapper():
-    return _mapper
+    GLib.idle_add(warm)
+
+
+def _build_dictionary_detector():
+    """Build the word-list tier from config, or return None if it is off.
+
+    Returns None when the user has switched it off or when nothing is
+    installed, which leaves the tier out of the chain entirely rather than
+    having it decline every question.
+    """
+    if not getattr(_config, "dictionary_enabled", True):
+        return None
+    try:
+        from .dictionary_detector import DictionaryDetector
+        detector = DictionaryDetector(
+            languages=_config.enabled_languages,
+            min_words=_config.dictionary_min_words,
+            min_share=_config.dictionary_min_share,
+            max_entries=_config.dictionary_max_words,
+        )
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        log.warning(f"Polyglot: dictionary detection unavailable: {error}")
+        return None
+
+    available = detector.available_languages()
+    if len(available) < 2:
+        # One list cannot be compared against anything, so every unknown
+        # word would look like a miss and every hit like a win.
+        if available:
+            log.info(
+                f"Polyglot: only one word list installed ({available[0]}); "
+                "the dictionary tier needs at least two. Run "
+                "fetch-dictionaries.sh to add more."
+            )
+        return None
+    log.info(f"Polyglot: word lists available for {', '.join(available)}")
+    return detector
+
 
 def reload_config():
     """Reload configuration and reinitialize detector."""
@@ -1869,7 +2292,8 @@ def reload_config():
         return
 
     _config.load()
-    _mapper.reload()
+    from .available_voices import invalidate as _invalidate_voices
+    _invalidate_voices()
 
     if not _config.enabled:
         _detector = None
@@ -1883,7 +2307,9 @@ def reload_config():
         default_language=_config.default_language,
         switch_confidence=_config.switch_confidence,
         mixed_max_words=_config.mixed_max_words,
+        dictionaries=_build_dictionary_detector(),
+        detection_order=_config.detection_order,
     )
     _current_language = _config.default_language
     _detector.current_language = _current_language
-    _rebuild_acss_cache()
+    _rebuild_configured_languages()
