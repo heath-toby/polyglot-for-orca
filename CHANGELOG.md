@@ -5,6 +5,57 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.1] — 2026-10-08
+
+### Fixed
+
+- **A line whose braille table changed was rendered half in the old table.**
+  Moving onto a German line showed something that was neither German nor
+  English: the right number of cells, but hybrid dots — 1246 where German
+  wants 46 — and it stayed that way until you moved off the line and back.
+
+  Only one braille table can be active at a time, so the line on the display
+  owns it, and `update_braille` is the one place that decides. That was
+  always the design; it was documented in `_switch_language`'s own
+  docstring. But `also_braille` defaulted to `True`, and four speech-side
+  call sites simply did not pass `False`: two in `_patched_speak`, one in its
+  markup-only branch, and one in `_patched_speak_character`. Speech runs
+  after `update_braille` has settled the line, once per utterance and once
+  per character, so a single English word or echoed letter re-pointed both
+  the liblouis contraction table and BRLTTY's computer-braille table at
+  English while the German line was still on the display. Changing BRLTTY's
+  table re-renders what is already there, which is why the cell count stayed
+  German and the dots did not. Arrowing down and back up ran
+  `update_braille` again and put it right.
+
+  Found in the debug log as `speak_char: char='n' lang=en` followed by
+  `_switch_language: de -> en (also_braille=True)`, in gedit, on a German
+  document.
+
+  `also_braille` now defaults to `False`, so braille is opt-in and
+  `update_braille` is the only caller that asks for it. A new call site that
+  forgets is now harmless rather than wrong.
+
+- **IPA and Unicode-braille lines got their table only by accident.** Both
+  are braille-only sentinels: they name a contraction table and have no
+  voice, so neither is ever an enabled language — and `_language_of_line`
+  keeps only enabled languages. In `markup_text` and `always` modes the
+  braille path therefore never saw them, and their tables were being set
+  purely as a side effect of the speech-side leak above. Closing that leak
+  without this would have taken IPA and Unicode-braille braille away
+  altogether. `update_braille` now asks for them outright, through a new
+  `_braille_sentinel`.
+
+### Added
+
+- Eight rows in `tests-language-matrix.py` (48 total), covering what the
+  modes have in common: whatever table the focus line settles on, speaking
+  English on it — as an utterance, a character, or a short label — must not
+  move it; and a Unicode-braille or IPA line must get its table from the
+  braille path. Each half was checked by reverting it: the three ownership
+  rows fail with the leak restored, and the two sentinel rows fail with the
+  leak closed but the sentinel lookup removed.
+
 ## [2.8.0] — 2026-10-06
 
 ### Changed

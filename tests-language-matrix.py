@@ -153,20 +153,87 @@ def braille(obj):
             raise
     return list(applied)
 
-si._switch_language("en")
+def set_tables(lang):
+    """Establish a starting braille table for the rows below.
+
+    _switch_language no longer touches braille unless asked -- braille is
+    opt-in now, so that a speech-side call cannot drag the tables off the
+    focus line. Setup that wants a starting table has to say so.
+    """
+    si._switch_language(lang, also_braille=True)
+
+
+set_tables("en")
 check("braille follows a German line", DE_TABLE in braille(TextObj(GER)), True)
-si._switch_language("de")
+set_tables("de")
 check("braille follows an English line", EN_TABLE in braille(TextObj(ENG)), True)
 # A frame or a button is not text: it must not touch the table at all. This
 # is the fix -- those objects used to yield a language and switch it.
-si._switch_language("de")
+set_tables("de")
 check("a button does not move the braille table", braille(Button("OK")), [])
 check("a frame does not move the braille table", braille(Button("some window")), [])
 # Repeated calls for one event must not re-switch.
-si._switch_language("en")
+set_tables("en")
 ger = TextObj(GER)
 braille(ger)
 check("repeat calls for one line do not re-switch", braille(ger), [])
+
+# --- braille belongs to the line on the display, not to the speech -------
+# Only one braille table can be active at a time, so update_braille owns it.
+# The speech-side patches run after it, per utterance and per character, and
+# they used to switch tables too: a German line then had its German
+# contraction rendered through an English text table -- the right number of
+# cells with the wrong dots -- and stayed that way until the user moved off
+# the line and back. These rows are the regression.
+set_tables("en")
+ger_line = TextObj(GER)
+braille(ger_line)
+# Which table it is depends on the mode -- markup-only reads nothing out of a
+# Latin-script line, so a German paragraph legitimately settles on the default
+# language's table there. What must hold in every mode is the next three rows:
+# whatever the line settled on, speech does not move it.
+_expected = EN_TABLE if MODE == "markup_only" else DE_TABLE
+check("the focus line owns the braille table",
+      si._current_contraction_table, _expected)
+_settled = si._current_contraction_table
+
+p._speak(ENG)
+check("speaking English on a German line leaves braille alone",
+      si._current_contraction_table, _settled)
+try:
+    p.speak_character("n")
+except Exception as _error:
+    print(f"  (speak_character raised {type(_error).__name__}: {_error})")
+check("a character spoken in English leaves braille alone",
+      si._current_contraction_table, _settled)
+p._speak("OK")
+check("a short label spoken in English leaves braille alone",
+      si._current_contraction_table, _settled)
+# ...and the line still owns it afterwards: a fresh update_braille for the
+# same line must not have to undo anything.
+braille(TextObj(GER))
+check("the line's table survives a round of speech",
+      si._current_contraction_table, _settled)
+
+# Braille-only sentinels name a table rather than a language, so they are
+# never enabled languages and _language_of_line drops them. update_braille
+# has to ask for them outright -- until it did, an IPA or Unicode-braille
+# line got its table only from the speech-side leak above, which means
+# closing the leak without this would have taken both tables away.
+BRL_LINE = "\u2801\u2803\u2809\u2819\u2811\u280b\u281b"
+IPA_LINE = "\u02a7\u0283\u025b\u0279\u0254\u00f8"
+BRL_TABLE = "/usr/share/liblouis/tables/unicode-braille.utb"
+IPA_TABLE = "/usr/share/liblouis/tables/IPA.utb"
+set_tables("en")
+check("a Unicode-braille line gets the pass-through table",
+      BRL_TABLE in braille(TextObj(BRL_LINE)), True)
+set_tables("en")
+check("an IPA line gets the IPA table",
+      IPA_TABLE in braille(TextObj(IPA_LINE)), True)
+# A sentinel must not become the spoken language: there is no voice for it.
+check("a braille sentinel does not become the voice",
+      si._current_language in ("en", "de", "ru"), True)
+set_tables("en")
 
 # --- the speech dictionary -------------------------------------------------
 from polyglot import speech_dictionary as sd

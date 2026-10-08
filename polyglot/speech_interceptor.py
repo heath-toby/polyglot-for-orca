@@ -921,29 +921,41 @@ def _rebuild_configured_languages():
     with no voice chosen silently never switched. Now ticking it is enough.
     """
     global _configured_languages, _focus_line_language, _line_language_cache
+    global _line_sentinel_cache
     _configured_languages = set(_config.enabled_languages)
     _fallback_families.clear()
     _focus_line_language = None
     _line_language_cache = None
+    _line_sentinel_cache = None
     log.info(
         "Polyglot: configured languages: "
         + (", ".join(sorted(_configured_languages)) or "(none)")
     )
 
 
-def _switch_language(lang_code, also_braille: bool = True):
-    """Switch voice (and optionally braille tables) for the detected language.
+def _switch_language(lang_code, also_braille: bool = False):
+    """Switch the voice, and the braille tables only if asked.
 
-    ``also_braille`` controls whether the contraction + BRLTTY text tables
-    are switched as a side effect. ``_patched_update_braille`` is the
-    canonical authority for braille — speech-side patches (``_patched_voice``,
-    ``_patched_speak``, ``_patched_speak_character``) pass ``False`` so that
-    a transient speech-time language switch (e.g. an English notification
-    arriving while a German line is focused) doesn't perturb the focus
-    line's braille tables. Symbol-name locale is treated as speech-side
-    state and switches regardless — it follows the active speech.
+    ``also_braille`` defaults to False because the safe answer is the common
+    one: ``_patched_update_braille`` is the single authority for braille and
+    the only caller that passes True. It used to default to True, and the
+    four speech-side call sites that simply forgot to pass False were enough
+    to drag the tables off the focus line. Opting in makes a new call site
+    harmless by default rather than wrong by default.
+
+    Symbol-name locale is speech-side state and switches regardless — it
+    follows the active speech.
     """
     global _current_language, _in_detection
+
+    # Only _patched_update_braille passes also_braille=True. Everything on
+    # the speech side passes False, because only one braille table can be
+    # active at a time and the line on the display owns it. A speech-side
+    # switch happens per utterance and per character, after update_braille
+    # has already settled the line: letting those move the tables rendered
+    # the line's German contraction through an English text table, giving
+    # the right number of cells with the wrong dots until the user moved off
+    # the line and back.
 
     # IPA sentinel — switch braille table only, don't change voice or current language
     if lang_code == "ipa":
@@ -1012,6 +1024,13 @@ def _switch_language(lang_code, also_braille: bool = True):
 
 
 _current_names_locale = None
+
+
+# "Languages" that exist only to name a braille table. There is no voice
+# for either, so neither is ever an enabled language -- which is why they do
+# not survive the _configured_languages filter that _language_of_line
+# applies. See _braille_sentinel.
+_BRAILLE_ONLY_SENTINELS = ("ipa", "unicode_braille")
 
 
 def _set_orca_names_locale(lang_code):
@@ -1193,6 +1212,41 @@ def _language_of_line(text: str) -> str | None:
         _debug(f"_language_of_line: {detected} <- {text[:40]!r}")
         return detected
     return None
+
+
+# The last line a sentinel was resolved for. Separate from
+# _line_language_cache because the two callers want different answers about
+# the same text: speech wants a spoken language, braille wants a table.
+_line_sentinel_cache: tuple[str, str | None] | None = None
+
+
+def _braille_sentinel(text: str) -> str | None:
+    """"ipa" or "unicode_braille" if that is what this line is, else None.
+
+    These name a braille table rather than a language, and _switch_language
+    treats them that way: it sets the table and leaves the voice and the
+    current language alone. Because there is no voice for either, neither is
+    ever an enabled language, so neither survives _language_of_line -- which
+    keeps only configured languages. The braille path therefore could not
+    see them at all in markup_text or always mode, and an IPA or
+    Unicode-braille line got its table only as a side effect of a
+    speech-side switch that had no business touching braille. Closing that
+    leak means asking for them here, deliberately.
+
+    Cached like _language_of_line and for the same reason: Orca calls
+    update_braille several times for one focus change.
+    """
+    global _line_sentinel_cache
+    if _detector is None:
+        return None
+    if _line_sentinel_cache is not None and _line_sentinel_cache[0] == text:
+        return _line_sentinel_cache[1]
+    found = _detector.detect(text, statistical=False, fallback_to_current=False)
+    found = found if found in _BRAILLE_ONLY_SENTINELS else None
+    _line_sentinel_cache = (text, found)
+    if found:
+        _debug(f"_braille_sentinel: {found} <- {text[:40]!r}")
+    return found
 
 
 def _context_language(obj, string) -> str | None:
@@ -1579,7 +1633,7 @@ def _apply_patches():
                         trusted_lang = candidate
                 if trusted_lang:
                     _debug(f"_speak: trust acss lang={trusted_lang} text={text[:40]!r}")
-                    _switch_language(trusted_lang)
+                    _switch_language(trusted_lang, also_braille=False)
                 elif mode == "markup_only":
                     # Strict rule: explicit signal → that language;
                     # otherwise default. The signal is either (a) the
@@ -1598,7 +1652,7 @@ def _apply_patches():
                     if not explicit:
                         explicit = _config.default_language
                     _debug(f"_speak: text={text[:40]!r} explicit={explicit}")
-                    _switch_language(explicit)
+                    _switch_language(explicit, also_braille=False)
                     if acss is None:
                         lang_acss = _get_lang_acss(explicit)
                         if lang_acss:
@@ -1608,7 +1662,7 @@ def _apply_patches():
                     detected = _detector.detect(text, statistical=statistical)
                     _debug(f"_speak: text={text[:40]!r} detected={detected}")
                     if detected:
-                        _switch_language(detected)
+                        _switch_language(detected, also_braille=False)
                         lang_acss = _get_lang_acss(detected)
                         if lang_acss:
                             acss = lang_acss
@@ -1761,7 +1815,7 @@ def _apply_patches():
                     explicit = _current_language or _config.default_language
                 _debug(f"speak_char: char={character!r} lang={explicit}")
                 if explicit:
-                    _switch_language(explicit)
+                    _switch_language(explicit, also_braille=False)
         except Exception as e:
             _debug(f"speak_char lang: ERROR {e}")
 
@@ -2037,16 +2091,23 @@ def _apply_patches():
                                 if not detected:
                                     detected = _config.default_language
                             elif mode in ("markup_text", "always"):
-                                # Cached per line text, so the repeated
-                                # calls Orca makes for one event cost a
-                                # string comparison rather than a fresh
-                                # detection and a churned word buffer.
-                                detected = _language_of_line(text)
+                                # Sentinel first: a line of IPA or of
+                                # Unicode dot patterns names a table
+                                # outright, and _language_of_line drops
+                                # both for not being enabled languages.
+                                # Then the line's language, cached per line
+                                # text so the repeated calls Orca makes for
+                                # one event cost a string comparison rather
+                                # than a fresh detection and a churned word
+                                # buffer.
+                                detected = (_braille_sentinel(text)
+                                            or _language_of_line(text))
                             else:
                                 detected = _detector.detect(text)
                         if detected:
                             _debug(f"update_braille: detected={detected}")
-                            _switch_language(detected)
+                            # The one caller that owns the braille tables.
+                            _switch_language(detected, also_braille=True)
                             # Pin this as the focus-line state so the
                             # flash hook has a clean snapshot
                             # regardless of any speech-time mutations,

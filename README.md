@@ -295,7 +295,7 @@ with `POLYGLOT_TEST_MODE`:
 POLYGLOT_TEST_MODE=markup_text python3 tests-language-matrix.py
 ```
 
-**markup_text** and **always** pass all 40 rows. **markup_only** fails seven of them, all
+**markup_text** and **always** pass all 48 rows. **markup_only** fails seven of them, all
 German, and that is the mode behaving as documented rather than a defect: with no language
 markup to go on it uses the default language and does no content detection, so German text in
 an unmarked document reads in the default voice. If you run markup_only and want German
