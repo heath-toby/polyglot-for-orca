@@ -74,20 +74,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   when it doesn't — an English message on an English line should not cost a
   re-translation of the whole display.
 
-- **The redraw was gated on the wrong thing, and the log now says so.** The
-  table being already correct was taken to mean the display was already
-  correct. It does not: the cells may have been translated under a different
-  table, or belong to another line. Diagnosing that from Polyglot's own log
-  twice produced the wrong answer, because what Orca has on the display cannot
-  be deduced from what Polyglot did. With `ORCA_POLYGLOT_DEBUG=1` the log now
-  records, at each point where a redraw was considered and declined, which line
-  Orca is showing, whether a flash is up, and which table the cells were
-  translated under — plus which flash hook fired and whether the restore ran or
-  was skipped and why.
+- **The redraw was gated on the wrong thing.** "Did the table move?" was used
+  as a proxy for "does the display need redrawing?", and it is not one. With
+  the display state now in the log, that one wrong idea accounted for every
+  remaining symptom, in three forms:
+
+  1. **The flash restore was skipped on exactly the case that needed it.** A
+     guard compared the focus line's tables against the snapshot taken at
+     flash entry, and skipped the restore when they disagreed, reasoning that
+     a line rendered during the flash must not be undone. But focus almost
+     always moves during a flash — switching workspace announces the
+     workspace, focus then lands on the document, and "Focus mode" flashes on
+     top of that — so the snapshot is the previous window's language while the
+     focus line is the new one's. When they disagree the tables are sitting at
+     the *flash default*, not at the new line's language, so skipping left
+     `en-ueb-g2` live on a Russian paragraph:
+
+     ```
+     flash restore: skipped (flash_default=True focus_line_unchanged=False)
+     display[after kill_flash(False)]: table=en-ueb-g2.ctb
+         showing="'\x043f''\x0430''\x043c''\x044f''\x0442'..."
+     ```
+
+     That is the Cyrillic falling through a table that cannot map it, shown as
+     literal escapes. The restore now targets the line that has focus *now*,
+     falling back to the snapshot, and the guard is gone. It is a no-op when a
+     line really did render during the flash, because that render set the focus
+     line's tables itself.
+
+  2. **A focus change is itself reason to rebuild.** The display holds whatever
+     Orca last brailled, which on a window switch is the *frame* — the window
+     title — and Orca does not necessarily replace it. Gating on the table
+     meant that returning to a Russian document while the Russian table
+     happened to still be active left the title sitting there. In one
+     five-minute session 138 focus changes declined to redraw on that
+     reasoning, several onto a document whose title line was still showing.
+     The focus hook now rebuilds whenever it settles a language for a text
+     line; window furniture still yields nothing and is still left alone.
+
+  3. **The table being right says nothing about the cells.** Contracted braille
+     caches each line's liblouis output, so cells translated under a previous
+     table stay until something re-translates them — and a caret move inside
+     the same object is answered by `try_reposition_cursor` from that very
+     cache. Measured: seventeen seconds of Cyrillic shown as escapes with
+     `ru-litbrl-detailed.utb` active throughout and the cursor moving the whole
+     time. Polyglot now tracks the table the cells on the display were
+     translated under, separately from the table that is active, and the caret
+     hook rebuilds when the two diverge even though nothing "changed".
+
+- **The debug log says what cannot be inferred.** Diagnosing this from
+  Polyglot's own log twice produced the wrong answer, because what Orca has on
+  the display is not deducible from what Polyglot did. With
+  `ORCA_POLYGLOT_DEBUG=1` the log now records, wherever a redraw was considered
+  and declined, which line Orca is showing, whether a flash is up, which table
+  is active, which table the cells were rendered under and whether that makes
+  them stale — plus which flash hook fired and whether the restore ran or was
+  skipped and why.
 
 ### Tests
 
-- 71 → 88 rows. The new ones pin the focus-line snapshot on all three paths
+- 71 → 97 rows. The new ones pin the focus-line snapshot on all three paths
   (caret move, focus change, rebuild), drive the flash round trip and assert the
   line's tables come back, keep the two guards that must not restore (a new line
   rendered during the flash, and no flash in progress), check the three
@@ -98,6 +144,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Three more for the cache: the restore drops the cached translation of every
   displayed line when it moves the table, drops nothing when it doesn't, and
   the row covering the first case fails if the invalidation is removed.
+- Nine more for the redraw gate, one group per form above: the window-switch
+  sequence in order (English line, workspace flash, focus into the document,
+  "Focus mode" on top) asserting the restore follows focus rather than the
+  snapshot; a focus change onto a Russian line with the Russian table already
+  live asserting it redraws anyway; and a display deliberately left holding
+  cells from another table asserting the caret path rebuilds it, for the right
+  object, and clears the staleness. Each group verified by reverting its own
+  fix and watching only its own rows fail.
+- The row named "no table change means no redraw" is gone. It asserted the
+  wrong idea, which is why it was green through all three of the symptoms
+  above. The harness's redraw spy also notes the re-translation a real redraw
+  performs; without that it modelled nothing.
 - The harness's stand-in for `_set_contraction_table` now carries BRLTTY's text
   table along with it, the way the real one does. Without that the text table
   never moved under test, so the rows reading it would have passed whatever the

@@ -1254,6 +1254,7 @@ def _rerender_braille() -> None:
         from orca import braille
         _invalidate_displayed_lines()
         braille.refresh(pan_to_cursor=True, stop_flash=False)
+        _note_display_rendered()
         _debug("rerendered braille under the new tables")
     except Exception as error:  # pylint: disable=broad-exception-caught
         _debug(f"_rerender_braille: {type(error).__name__}: {error}")
@@ -1280,6 +1281,30 @@ def _invalidate_displayed_lines() -> None:
                 pass
     except Exception as error:  # pylint: disable=broad-exception-caught
         _debug(f"_invalidate_displayed_lines: {type(error).__name__}: {error}")
+
+
+# The table the cells currently on the display were translated under, as
+# distinct from the table that is active. Conflating the two is what left a
+# Russian paragraph showing as literal \x04.. escapes for seventeen seconds
+# with ru-litbrl-detailed.utb active the whole time: contracted braille
+# caches each line's liblouis output, so the active table describes the NEXT
+# translation, not the cells already on the display.
+_display_contraction_table: str | None = None
+
+
+def _note_display_rendered() -> None:
+    """Record that the display now holds cells from the active table.
+
+    Called after anything that re-translates: a rebuild, a flash restore that
+    drops the caches, or our own invalidate-and-refresh.
+    """
+    global _display_contraction_table
+    _display_contraction_table = _current_contraction_table
+
+
+def _display_is_stale() -> bool:
+    """True if the cells showing were translated under a different table."""
+    return _display_contraction_table != _current_contraction_table
 
 
 def _describe_display(source: str) -> None:
@@ -1311,9 +1336,12 @@ def _describe_display(source: str) -> None:
                         for r in lines[index].get_regions())[:60]
                 except Exception:  # pylint: disable=broad-exception-caught
                     shown = "<unreadable>"
+        stale = " STALE" if _display_is_stale() else ""
         _debug(f"display[{source}]: lines={len(lines)} viewport={viewport} "
                f"flash={braille.is_flash_active()} "
                f"table={os.path.basename(_current_contraction_table or '')} "
+               f"rendered_under="
+               f"{os.path.basename(_display_contraction_table or '')}{stale} "
                f"showing={shown!r}")
     except Exception as error:  # pylint: disable=broad-exception-caught
         _debug(f"_describe_display: {type(error).__name__}: {error}")
@@ -1344,6 +1372,7 @@ def _redraw_braille_for(obj) -> None:
             script = script_manager.get_manager().get_active_script()
             if script is not None:
                 script.update_braille(obj)
+                _note_display_rendered()
                 _debug("redrew braille for the object under the new tables")
                 return
         except Exception as error:  # pylint: disable=broad-exception-caught
@@ -1353,7 +1382,9 @@ def _redraw_braille_for(obj) -> None:
     _rerender_braille()
 
 
-def _apply_braille_language(obj, offset=None, source: str = "braille") -> bool:
+def _apply_braille_language(
+    obj, offset=None, source: str = "braille"
+) -> tuple[bool, bool]:
     """Set the braille tables for the line ``obj`` is showing. Never raises.
 
     This is the one owner of the braille tables. It is deliberately NOT on the
@@ -1377,7 +1408,7 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> bool:
         mode = _config.detection_mode if _config else "markup_text"
         if not (_config and _config.enabled and _detector and obj is not None
                 and not _is_app_ignored() and mode != "off"):
-            return False
+            return False, False
         # Resolved the same way the speech path resolves it, which gates on
         # the object actually being text. It was previously asked for a line
         # from whatever it was handed -- a frame, a label -- and the English
@@ -1386,7 +1417,7 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> bool:
         # German document, this logged en, de, en, de in a second.
         text = _container_line(obj, offset)
         if not text:
-            return False
+            return False, False
         detected = None
         # Prefer obj-locale (markup signal) in non-always modes.
         if mode != "always":
@@ -1412,10 +1443,11 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> bool:
             else:
                 detected = _detector.detect(text)
         if not detected:
-            return False
+            return False, False
         _debug(f"{source}: detected={detected}")
         before = (_current_contraction_table, _current_brltty_text_table)
         _switch_language(detected, also_braille=True)
+        settled = True
         # Pin this as the focus-line state so the flash hook has a clean
         # snapshot regardless of any speech-time mutations, and so character
         # announcements within this line can read its language. This must
@@ -1425,13 +1457,18 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> bool:
         # back. Reading a Russian line and being told "Focus mode" left the
         # display in English until some unrelated edit rebuilt the line.
         _record_focus_line_state()
-        # Report whether the tables moved; the caller decides what to redraw,
-        # because only the caller knows which object the display should be
-        # showing by the time it is done.
-        return (_current_contraction_table, _current_brltty_text_table) != before
+        # Two separate facts, and conflating them was the bug that outlived
+        # three releases. "settled" means this is a text line we resolved a
+        # language for, so the display ought to be showing it. "changed"
+        # means the tables moved. A caller that redraws only when the tables
+        # moved will sit on the window title, or on cells translated under
+        # the previous table, for as long as the language happens to agree.
+        return (settled,
+                (_current_contraction_table,
+                 _current_brltty_text_table) != before)
     except Exception as error:  # pylint: disable=broad-exception-caught
         _debug(f"{source} pre: ERROR {type(error).__name__}: {error}")
-    return False
+    return False, False
 
 
 def _language_of_line(text: str) -> str | None:
@@ -1589,16 +1626,33 @@ def _restore_pre_flash_state() -> None:
         _current_contraction_table == _flash_default_contraction
         and _current_brltty_text_table == _flash_default_brltty
     )
-    focus_line_unchanged = (
-        _focus_line_contraction_table == _pre_flash_focus_contraction
-        and _focus_line_brltty_text_table == _pre_flash_focus_brltty
-    )
-    if tables_still_flash_default and focus_line_unchanged:
+    # Restore to the line that has focus NOW, falling back to the snapshot
+    # taken when the flash began. They differ constantly, because focus
+    # usually moves during a flash: switching workspace announces the
+    # workspace, focus then lands on the document, and "Focus mode" flashes
+    # on top of that -- so the snapshot is the previous window's language
+    # while the focus line is the new one's.
+    #
+    # There used to be a guard here that skipped the restore entirely when
+    # those two disagreed, on the reasoning that a line rendered during the
+    # flash must not be undone. The reasoning was wrong: when they disagree
+    # the tables are sitting at the FLASH DEFAULT, not at the new line's
+    # language, so skipping left English braille live on a Russian paragraph.
+    # Measured, twice in one five-minute session: the display showing the
+    # Cyrillic as literal \x04.. escapes, because en-ueb-g2 cannot map it.
+    # Restoring to the focus line is right in both cases -- it is a no-op
+    # when a line really did render during the flash, since that render set
+    # the focus line's tables itself.
+    target_contraction = (_focus_line_contraction_table
+                          or _pre_flash_focus_contraction)
+    target_brltty = (_focus_line_brltty_text_table
+                     or _pre_flash_focus_brltty)
+    if tables_still_flash_default:
         before = _current_contraction_table
-        if _pre_flash_focus_contraction is not None:
-            _set_contraction_table(_pre_flash_focus_contraction)
-        if _pre_flash_focus_brltty is not None:
-            _set_brltty_text_table(_pre_flash_focus_brltty)
+        if target_contraction is not None:
+            _set_contraction_table(target_contraction)
+        if target_brltty is not None:
+            _set_brltty_text_table(target_brltty)
         if _current_contraction_table != before:
             # The cells on the display were translated under the flash's
             # table. Orca drops the line caches on its own restore paths
@@ -1611,12 +1665,13 @@ def _restore_pre_flash_state() -> None:
             # time, and a caret move inside the same object is answered by
             # try_reposition_cursor from the cache.
             _invalidate_displayed_lines()
+            _note_display_rendered()
             _debug("flash restore: dropped the line caches, "
                    "cells were translated under the flash table")
     else:
-        _debug(f"flash restore: skipped "
-               f"(flash_default={tables_still_flash_default} "
-               f"focus_line_unchanged={focus_line_unchanged})")
+        # Something deliberately moved the tables while the flash was up, so
+        # they are no longer the flash's. Leave them where they are.
+        _debug("flash restore: skipped, tables are no longer the flash's")
     _in_flash = False
     _pre_flash_focus_contraction = None
     _pre_flash_focus_brltty = None
@@ -2303,6 +2358,7 @@ def _apply_patches():
             _debug("update_braille: calling original...")
             try:
                 result = _original_update_braille(self, obj, **args)
+                _note_display_rendered()
                 _debug("update_braille: done")
                 return result
             except Exception as e:
@@ -2350,7 +2406,8 @@ def _apply_patches():
                     pass
                 # Before the original, so the table is in place whether Orca
                 # repositions the cursor and refreshes, or rebuilds the line.
-                changed = _apply_braille_language(obj, None, "caret-braille")
+                settled, changed = _apply_braille_language(
+                    obj, None, "caret-braille")
                 try:
                     return _original_caret_braille(self, obj)
                 finally:
@@ -2361,8 +2418,20 @@ def _apply_patches():
                     # the original turned out.
                     if changed:
                         _redraw_braille_for(obj)
+                    elif settled and _display_is_stale():
+                        # The table is already right, so nothing "changed" --
+                        # but the cells showing were translated under a
+                        # different one, and a caret move inside the same
+                        # object is answered by try_reposition_cursor
+                        # straight from that cache. Measured: seventeen
+                        # seconds of Cyrillic shown as \x04.. escapes with
+                        # the Russian table active throughout, the cursor
+                        # moving the whole time. This is the only thing that
+                        # breaks that loop.
+                        _debug("caret: display is stale, rebuilding")
+                        _redraw_braille_for(obj)
                     else:
-                        _describe_display("caret, no table change")
+                        _describe_display("caret, no redraw")
 
             _patch(DefaultScript, "_update_braille_caret_position",
                    _patched_caret_braille)
@@ -2392,7 +2461,8 @@ def _apply_patches():
                 # Non-text focus -- a frame, a button -- returns None from
                 # _container_line and is left alone, so window furniture
                 # cannot drag the table off the content.
-                changed = _apply_braille_language(obj, None, "focus-braille")
+                settled, changed = _apply_braille_language(
+                    obj, None, "focus-braille")
                 try:
                     return _original_set_locus(
                         self, event, obj, notify_script, force)
@@ -2404,10 +2474,21 @@ def _apply_patches():
                     # replace it. Measured: 18 seconds between focus landing
                     # on a Russian paragraph and the next update_braille.
                     # In a finally for the same reason as the caret hook.
-                    if changed:
+                    # Not gated on the table having moved. A focus change
+                    # is itself the reason to rebuild: the display is still
+                    # showing whatever Orca last brailled, which on a window
+                    # switch is the FRAME -- the window title -- and Orca
+                    # does not necessarily replace it. Gating on the table
+                    # meant that coming back to a Russian document while the
+                    # Russian table happened to still be active left the
+                    # window title sitting on the display. In one five-minute
+                    # session 138 focus changes declined to redraw on that
+                    # reasoning, several of them onto a document whose title
+                    # line was still showing.
+                    if settled:
                         _redraw_braille_for(obj)
                     else:
-                        _describe_display("focus, no table change")
+                        _describe_display("focus, not a text line")
 
             _patch(focus_manager.FocusManager, "set_locus_of_focus",
                    _patched_set_locus)
@@ -2458,6 +2539,7 @@ def _apply_patches():
             try:
                 return _original_flash_callback()
             finally:
+                _note_display_rendered()
                 _describe_display("after flash timeout")
 
         def _patched_kill_flash(restore_saved=True):
@@ -2478,6 +2560,12 @@ def _apply_patches():
             try:
                 return _original_kill_flash(restore_saved)
             finally:
+                # Only the restoring form re-translates: Orca drops the line
+                # caches there. kill_flash(restore_saved=False) keeps both
+                # the lines and their caches, so it changes nothing about
+                # what the cells were translated under.
+                if restore_saved:
+                    _note_display_rendered()
                 _describe_display(f"after kill_flash({restore_saved})")
 
         _patch(braille, "display_message", _patched_display_message)
@@ -2498,6 +2586,7 @@ def uninstall():
     """
     global _installed, _detector, _config, _current_language
     global _current_names_locale, _line_language_cache, _in_flash
+    global _display_contraction_table
 
     if not _installed:
         return
@@ -2512,6 +2601,7 @@ def uninstall():
     _current_names_locale = None
     _line_language_cache = None
     _in_flash = False
+    _display_contraction_table = None
     _fallback_families.clear()
     log.info("Polyglot: uninstalled")
 

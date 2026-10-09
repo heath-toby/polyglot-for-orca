@@ -273,6 +273,9 @@ _real_redraw = si._redraw_braille_for
 
 def _spy_redraw(obj):
     redraws.append(obj)
+    # A real redraw re-translates the line, so it clears the stale flag.
+    # Leaving that out would make every subsequent row see a stale display.
+    si._note_display_rendered()
 
 
 si._redraw_braille_for = _spy_redraw
@@ -319,6 +322,7 @@ _sm.get_manager = lambda: type(
 
 
 set_tables("en")
+si._note_display_rendered()
 rerenders.clear()
 redraws.clear()
 rus = TextObj(RUS)
@@ -326,11 +330,38 @@ braille_caret(rus)
 check("a table change redraws, and for the object that changed", redraws, [rus])
 redraws.clear()
 braille_caret(TextObj(RUS))
-check("no table change means no redraw", redraws, [])
+check("a caret move with the display already in step does not redraw",
+      redraws, [])
 
 rerenders.clear()
 braille_caret(TextObj(RUS))
-check("no table change means no re-render", len(rerenders), 0)
+check("...and does not re-render either", len(rerenders), 0)
+
+# The table being right says nothing about the cells. Contracted braille
+# caches each line's liblouis output, so cells translated under the previous
+# table sit there until something re-translates them -- and a caret move
+# inside the same object is answered by try_reposition_cursor from that very
+# cache. Measured in his log: seventeen seconds of Cyrillic shown as \x04..
+# escapes with the Russian table active throughout and the cursor moving.
+# A redraw is the only thing that breaks that loop.
+set_tables("ru")
+si._note_display_rendered()
+si._display_contraction_table = EN_TABLE   # cells from the previous table
+redraws.clear()
+rus2 = TextObj(RUS)
+check("a stale display is stale even though the table matches",
+      si._display_is_stale(), True)
+check("...and the caret path rebuilds it anyway", braille_caret(rus2), [])
+check("...for the object the caret is in", redraws, [rus2])
+check("...and the rebuild clears the staleness", si._display_is_stale(), False)
+
+# Furniture still must not provoke a rebuild, stale display or not.
+set_tables("ru")
+si._display_contraction_table = EN_TABLE
+redraws.clear()
+braille_caret(Button("Cancel"))
+check("a stale display does not make a button worth redrawing", redraws, [])
+si._note_display_rendered()
 
 # Switching windows moves no caret, so the caret hook never fires. Focus
 # changes funnel through FocusManager.set_locus_of_focus, which is hooked for
@@ -359,7 +390,22 @@ check("focusing a Russian line switches braille to Russian",
       RU_TABLE in focus(focus_rus), True)
 check("...and redraws for it, not for the window title already displayed",
       redraws, [focus_rus])
-check("...and focusing it again does not switch", focus(TextObj(RUS)), [])
+check("...and focusing it again does not move the table", focus(TextObj(RUS)), [])
+# ...but it still redraws, which is the fix for the window title. The
+# display is showing whatever Orca last brailled, and on a window switch
+# that is the FRAME. His log: 138 focus changes in five minutes declined to
+# redraw because the table happened to agree, several onto a document whose
+# title line was still on the display -- 'Orca app Screen Reader...' in the
+# Russian table, while focus sat on a Russian paragraph.
+set_tables("ru")
+si._note_display_rendered()
+redraws.clear()
+same_rus = TextObj(RUS)
+check("focusing a Russian line with the Russian table already live "
+      "moves no table", focus(same_rus), [])
+check("...and redraws regardless, because the frame's line is showing",
+      redraws, [same_rus])
+
 check("focusing an English line switches back",
       EN_TABLE in focus(TextObj(ENG)), True)
 # Window furniture is not text and must not drag the table off the content.
@@ -449,7 +495,30 @@ si._restore_pre_flash_state()
 check("...so the restore drops nothing", [l.dropped for l in _lines], [0, 0])
 _braille._STATE.lines = []
 
-# The two guards that must survive: a flash that ends somewhere else.
+# The window-switch sequence, in order, which is the one that broke. Focus
+# moves DURING the flash: the workspace is announced, focus then lands on the
+# document, and "Focus mode" flashes on top. So the snapshot taken at flash
+# entry is the previous window's language while the focus line is the new
+# one's. A guard here used to see those disagree and skip the restore
+# entirely, on the reasoning that a line rendered during the flash must not
+# be undone -- but when they disagree the tables are at the FLASH DEFAULT,
+# not at the new line's language, so skipping left en-ueb-g2 live on a
+# Russian paragraph. His log caught it twice in five minutes, the display
+# showing the Cyrillic as literal \x04.. escapes.
+set_tables("en")
+braille(TextObj(ENG))                 # an English line, the previous window
+si._save_pre_flash_state()            # 'Workspace 4 docs' flashes
+si._switch_to_default_braille_tables()
+focus(TextObj(RUS))                   # focus lands on the Russian document
+si._switch_to_default_braille_tables()  # 'Focus mode' flashes on top
+check("the flash has the tables in the default language",
+      si._current_contraction_table, EN_TABLE)
+si._restore_pre_flash_state()
+check("the restore follows focus into the document, not the flash snapshot",
+      si._current_contraction_table, RU_TABLE)
+
+# The guard that must survive: tables deliberately moved elsewhere while the
+# flash was up are left where they are.
 set_tables("en")
 braille_caret(TextObj(RUS))
 si._save_pre_flash_state()
