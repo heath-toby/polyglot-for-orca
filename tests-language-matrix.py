@@ -128,9 +128,10 @@ si._set_contraction_table = _fake_set_contraction_table
 si._set_brltty_text_table = lambda code: None
 DE_TABLE = "/usr/share/liblouis/tables/de-g1-detailed.ctb"
 EN_TABLE = "/usr/share/liblouis/tables/en-ueb-g2.ctb"
+RU_TABLE = "/usr/share/liblouis/tables/ru-litbrl-detailed.ctb"
 c.language_settings = {"de": {"contraction_table": DE_TABLE},
                        "en": {"contraction_table": EN_TABLE},
-                       "ru": {"contraction_table": ""}}
+                       "ru": {"contraction_table": RU_TABLE}}
 si._rebuild_configured_languages()
 update_braille = DefaultScript.update_braille
 
@@ -162,6 +163,55 @@ def set_tables(lang):
     """
     si._switch_language(lang, also_braille=True)
 
+
+# Orca rebuilds the braille line only when it must. On a caret move it calls
+# _update_braille_caret_position, which tries to reposition the cursor on the
+# line already displayed and RETURNS if that works -- so update_braille never
+# runs. In a word processor the whole body is one accessible, so arrowing from
+# line to line takes that early return every time, and hooking update_braille
+# alone left braille in the previous language for as long as the caret stayed
+# inside the same object. Measured on a Russian document in LibreOffice:
+# speech switched at 09:40:44, braille at 09:40:54. These rows drive the caret
+# path, not update_braille, and are the regression for that.
+caret_braille_hook = DefaultScript._update_braille_caret_position
+
+
+def braille_caret(obj):
+    """Run Orca's per-caret-move braille path and report table changes."""
+    applied.clear()
+    try:
+        caret_braille_hook(FakeScript(), obj)
+    except Exception as error:
+        if not isinstance(error, (AttributeError, TypeError)):
+            raise
+    return list(applied)
+
+
+check("the per-caret-move braille path is Polyglot's, not Orca's",
+      "_patched_caret_braille" in getattr(caret_braille_hook, "__qualname__", ""),
+      True)
+
+set_tables("en")
+check("a caret move onto a Russian line switches braille to Russian",
+      RU_TABLE in braille_caret(TextObj(RUS)), True)
+check("...and staying on that line does not switch again",
+      braille_caret(TextObj(RUS)), [])
+check("a caret move back onto English switches back",
+      EN_TABLE in braille_caret(TextObj(ENG)), True)
+set_tables("en")
+# German has no script signal, so in markup-only mode a bare line of it is
+# not detectable at all and the table correctly stays put. Same reason the
+# rebuild-path German row below is mode-aware.
+check("a caret move onto a German line switches braille to German",
+      braille_caret(TextObj(GER)) == [] if MODE == "markup_only"
+      else DE_TABLE in braille_caret(TextObj(GER)), True)
+# The same guard the rebuild path has: furniture is not text, so it must not
+# drag the table off the focus line.
+set_tables("de")
+check("a caret move onto a button leaves the table alone",
+      braille_caret(Button("Cancel")), [])
+check("...and the German table is still the live one",
+      si._current_contraction_table, DE_TABLE)
 
 set_tables("en")
 check("braille follows a German line", DE_TABLE in braille(TextObj(GER)), True)

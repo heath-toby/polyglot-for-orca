@@ -1179,6 +1179,116 @@ def _container_line(obj, offset=None) -> str | None:
     return text if text and text.strip() else None
 
 
+# Module level, not nested in the patch installer: _apply_braille_language
+# below is module level too and cannot see a closure cell. Nested callers
+# resolve this as a global, so promoting it changes nothing for them.
+def _is_app_ignored():
+    """Check if the currently focused app is in the ignored list."""
+    try:
+        if not _config or not _config.ignored_apps:
+            return False
+        app_name = None
+        # Orca v50: use script_manager to get the active app
+        try:
+            from orca import script_manager
+            app = script_manager.get_manager().get_active_script_app()
+            if app:
+                from orca.ax_object import AXObject
+                app_name = AXObject.get_name(app)
+        except Exception:
+            pass
+        # Fallback: use focus_manager + Atspi
+        if not app_name:
+            try:
+                from orca import focus_manager
+                from gi.repository import Atspi
+                focus = focus_manager.get_manager().get_locus_of_focus()
+                if focus:
+                    app = Atspi.Accessible.get_application(focus)
+                    if app:
+                        app_name = Atspi.Accessible.get_name(app)
+            except Exception:
+                pass
+        if not app_name:
+            return False
+        _debug(f"_is_app_ignored: app={app_name!r} ignored={_config.ignored_apps}")
+        ignored_lower = {a.lower() for a in _config.ignored_apps}
+        return app_name.lower() in ignored_lower
+    except Exception as e:
+        _debug(f"_is_app_ignored ERROR {e}")
+        return False
+
+
+def _apply_braille_language(obj, offset=None, source: str = "braille") -> None:
+    """Set the braille tables for the line ``obj`` is showing. Never raises.
+
+    This is the one owner of the braille tables. It is deliberately NOT on the
+    speech path: a braille line belongs to the focus line as a whole, and
+    switching tables part-way through one is what produced hybrid cells --
+    dots 1246 where German wanted 46 -- because the characters already written
+    keep the table they were rendered with.
+
+    Called from two places, because Orca has two:
+
+      * Script.update_braille, which rebuilds the braille line from scratch.
+      * Script._update_braille_caret_position, which runs on EVERY caret move
+        and usually does not rebuild anything. See the patch for why that
+        matters; in short, update_braille alone misses most of the reading.
+
+    Within one line this costs a cached string comparison and then returns
+    early from _switch_language, so firing it per keypress is cheap and cannot
+    switch tables mid-line.
+    """
+    try:
+        mode = _config.detection_mode if _config else "markup_text"
+        if not (_config and _config.enabled and _detector and obj is not None
+                and not _is_app_ignored() and mode != "off"):
+            return
+        # Resolved the same way the speech path resolves it, which gates on
+        # the object actually being text. It was previously asked for a line
+        # from whatever it was handed -- a frame, a label -- and the English
+        # it got back from those was why the contraction table was switched
+        # to and fro several times per focus change: inside gedit, on a
+        # German document, this logged en, de, en, de in a second.
+        text = _container_line(obj, offset)
+        if not text:
+            return
+        detected = None
+        # Prefer obj-locale (markup signal) in non-always modes.
+        if mode != "always":
+            try:
+                from orca.ax_object import AXObject
+                detected = _normalize_lang_code(AXObject.get_locale(obj))
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        if not detected:
+            if mode == "markup_only":
+                detected = _detector.detect(
+                    text, statistical=False, fallback_to_current=False)
+                if not detected:
+                    detected = _config.default_language
+            elif mode in ("markup_text", "always"):
+                # Sentinel first: a line of IPA or of Unicode dot patterns
+                # names a table outright, and _language_of_line drops both
+                # for not being enabled languages. Then the line's language,
+                # cached per line text so the repeated calls Orca makes for
+                # one event cost a string comparison rather than a fresh
+                # detection and a churned word buffer.
+                detected = (_braille_sentinel(text) or _language_of_line(text))
+            else:
+                detected = _detector.detect(text)
+        if not detected:
+            return
+        _debug(f"{source}: detected={detected}")
+        _switch_language(detected, also_braille=True)
+        # Pin this as the focus-line state so the flash hook has a clean
+        # snapshot regardless of any speech-time mutations, and so character
+        # announcements within this line can read its language.
+        _record_focus_line_state()
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        _debug(f"{source} pre: ERROR {type(error).__name__}: {error}")
+
+
 def _language_of_line(text: str) -> str | None:
     """Detect the language of a container line, remembering the last answer.
 
@@ -1567,42 +1677,6 @@ def _apply_patches():
 
     # Patch presenter._speak — detect language and switch voice before speaking
     _original_speak = _presenter._speak
-
-    def _is_app_ignored():
-        """Check if the currently focused app is in the ignored list."""
-        try:
-            if not _config or not _config.ignored_apps:
-                return False
-            app_name = None
-            # Orca v50: use script_manager to get the active app
-            try:
-                from orca import script_manager
-                app = script_manager.get_manager().get_active_script_app()
-                if app:
-                    from orca.ax_object import AXObject
-                    app_name = AXObject.get_name(app)
-            except Exception:
-                pass
-            # Fallback: use focus_manager + Atspi
-            if not app_name:
-                try:
-                    from orca import focus_manager
-                    from gi.repository import Atspi
-                    focus = focus_manager.get_manager().get_locus_of_focus()
-                    if focus:
-                        app = Atspi.Accessible.get_application(focus)
-                        if app:
-                            app_name = Atspi.Accessible.get_name(app)
-                except Exception:
-                    pass
-            if not app_name:
-                return False
-            _debug(f"_is_app_ignored: app={app_name!r} ignored={_config.ignored_apps}")
-            ignored_lower = {a.lower() for a in _config.ignored_apps}
-            return app_name.lower() in ignored_lower
-        except Exception as e:
-            _debug(f"_is_app_ignored ERROR {e}")
-            return False
 
     def _patched_speak(content, acss=None, obj=None):
         # Language detection and voice switching. _patched_speak has no
@@ -2060,62 +2134,7 @@ def _apply_patches():
 
         def _patched_update_braille(self, obj, **args):
             _debug(f"update_braille: ENTER")
-            try:
-                mode = _config.detection_mode if _config else "markup_text"
-                if (_config.enabled and _detector and obj is not None
-                        and not _is_app_ignored() and mode != "off"):
-                    # Resolved the same way the speech path resolves it,
-                    # which gates on the object actually being text. It was
-                    # previously asked for a line from whatever it was
-                    # handed -- a frame, a label -- and the English it got
-                    # back from those was why the contraction table was
-                    # switched to and fro several times per focus change:
-                    # inside gedit, on a German document, this logged
-                    # en, de, en, de in the space of a second.
-                    text = _container_line(obj, args.get("offset"))
-                    if text:
-                        detected = None
-                        # Prefer obj-locale (markup signal) in non-always modes
-                        if mode != "always":
-                            try:
-                                from orca.ax_object import AXObject
-                                detected = _normalize_lang_code(
-                                    AXObject.get_locale(obj))
-                            except Exception:
-                                pass
-                        if not detected:
-                            if mode == "markup_only":
-                                detected = _detector.detect(
-                                    text, statistical=False,
-                                    fallback_to_current=False)
-                                if not detected:
-                                    detected = _config.default_language
-                            elif mode in ("markup_text", "always"):
-                                # Sentinel first: a line of IPA or of
-                                # Unicode dot patterns names a table
-                                # outright, and _language_of_line drops
-                                # both for not being enabled languages.
-                                # Then the line's language, cached per line
-                                # text so the repeated calls Orca makes for
-                                # one event cost a string comparison rather
-                                # than a fresh detection and a churned word
-                                # buffer.
-                                detected = (_braille_sentinel(text)
-                                            or _language_of_line(text))
-                            else:
-                                detected = _detector.detect(text)
-                        if detected:
-                            _debug(f"update_braille: detected={detected}")
-                            # The one caller that owns the braille tables.
-                            _switch_language(detected, also_braille=True)
-                            # Pin this as the focus-line state so the
-                            # flash hook has a clean snapshot
-                            # regardless of any speech-time mutations,
-                            # and so character announcements within
-                            # this line can read its language.
-                            _record_focus_line_state()
-            except Exception as e:
-                _debug(f"update_braille pre: ERROR {type(e).__name__}: {e}")
+            _apply_braille_language(obj, args.get("offset"), "update_braille")
 
             _debug("update_braille: calling original...")
             try:
@@ -2126,6 +2145,56 @@ def _apply_patches():
                 _debug(f"update_braille ORIGINAL CRASHED: {type(e).__name__}: {e}")
 
         _patch(DefaultScript, "update_braille", _patched_update_braille)
+
+        # update_braille alone is not enough, and this is the whole of the
+        # braille-lags-behind-speech bug.
+        #
+        # Orca only rebuilds the braille line when it has to. On a caret move
+        # it first calls _update_braille_caret_position, which tries
+        # braille.try_reposition_cursor(obj) -- and if the object whose caret
+        # moved is already on the display, that succeeds, calls refresh() and
+        # RETURNS, so update_braille is never reached:
+        #
+        #     if braille.try_reposition_cursor(obj):
+        #         return
+        #     self.update_braille(obj)
+        #
+        # In a word processor the body of the document is one accessible, so
+        # arrowing from line to line takes that early return every time.
+        # Measured in LibreOffice on a Russian document: speech switched to
+        # Russian at 09:40:44 and update_braille did not fire until 09:40:54 --
+        # ten seconds and many lines later, when the caret finally crossed
+        # into a different object. Panning does not help either, for the same
+        # reason: panning re-renders the existing line and never rebuilds it.
+        # That is exactly "I have to physically move the keyboard cursor to
+        # the right area".
+        #
+        # So hook the method that DOES run on every caret move, before Orca
+        # re-renders. The web script's override calls super(), so patching the
+        # default class covers it; soffice overrides _on_caret_moved but
+        # delegates to super(), which reaches here.
+        try:
+            _original_caret_braille = DefaultScript._update_braille_caret_position
+
+            def _patched_caret_braille(self, obj):
+                # Mirror Orca's own guard: no braille in use, nothing to do.
+                try:
+                    from orca import braille_presenter
+                    if not braille_presenter.get_presenter().use_braille():
+                        return _original_caret_braille(self, obj)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+                # Before the original, so the table is in place whether Orca
+                # repositions the cursor and refreshes, or rebuilds the line.
+                _apply_braille_language(obj, None, "caret-braille")
+                return _original_caret_braille(self, obj)
+
+            _patch(DefaultScript, "_update_braille_caret_position",
+                   _patched_caret_braille)
+            _debug("patched _update_braille_caret_position")
+        except Exception as e:
+            log.warning(
+                f"Polyglot: could not patch _update_braille_caret_position: {e}")
     except Exception as e:
         log.warning(f"Polyglot: could not patch update_braille: {e}")
 

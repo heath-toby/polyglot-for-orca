@@ -5,6 +5,64 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.2] — 2026-10-09
+
+### Fixed
+
+- **Braille stayed in the previous language while speech had already switched.**
+  Reading a Russian passage, the voice went Russian immediately and the display
+  resolutely did not — for many lines — until the caret happened to land in just
+  the right place, at which point it worked. Panning along the line did not help
+  either.
+
+  2.8.1 made `update_braille` the single owner of the braille tables, which was
+  right: only one table can be active at a time, so it belongs to the line on
+  the display, and switching it part-way through a line is what produced hybrid
+  cells. What 2.8.1 missed is that **Orca does not call `update_braille` on most
+  caret moves.** On a caret move it calls `_update_braille_caret_position`,
+  which tries to reposition the cursor on the line already displayed, and
+  returns the moment that succeeds:
+
+  ```python
+  if braille.try_reposition_cursor(obj):
+      return
+  self.update_braille(obj)
+  ```
+
+  In a word processor the body of the document is one accessible, so arrowing
+  from line to line takes that early return every time and never rebuilds the
+  line. Measured from the debug log on a Russian document in LibreOffice:
+  speech switched at 09:40:44 and `update_braille` did not fire until
+  09:40:54 — ten seconds and many lines later, when the caret finally crossed
+  into a different object. Panning fails for the same reason: it re-renders the
+  existing line rather than rebuilding it.
+
+  The table decision now also runs from `_update_braille_caret_position`, which
+  fires on every caret move, before Orca re-renders. Both paths share one
+  helper, so they cannot disagree, and braille remains owned by the focus line
+  rather than by speech — within a line the detected language is constant, the
+  per-line cache makes the repeat calls a string comparison, and
+  `_switch_language` returns early when nothing changed, so a table is still
+  never switched mid-line.
+
+  The web script's own override calls `super()`, so patching the default script
+  covers it; LibreOffice overrides `_on_caret_moved` but delegates to `super()`,
+  which reaches the same place.
+
+### Changed
+
+- `_is_app_ignored` moved from a closure inside the patch installer to module
+  level, so the shared braille helper can see it. Nested callers resolve it as a
+  global instead of a closure cell, which changes nothing for them.
+
+### Tests
+
+- `tests-language-matrix.py` is 48 rows → **55**. Four new rows drive the
+  per-caret-move path rather than `update_braille`, and all four were confirmed
+  to fail with the new hook reverted. Still 55/55 in `markup_text` and `always`,
+  and 48/55 in `markup_only` — the same seven documented mode failures as
+  before, since a bare German line has no script signal to detect.
+
 ## [2.8.1] — 2026-10-08
 
 ### Fixed
