@@ -1219,6 +1219,38 @@ def _is_app_ignored():
         return False
 
 
+def _rerender_braille() -> None:
+    """Re-render what is already on the display under the new tables.
+
+    Changing a table does not redraw anything by itself. Orca caches each
+    line's rendered form (``Line._info_cache``), and with contracted braille
+    on that cache holds the liblouis output, so a table change is invisible
+    until something rebuilds or re-renders the line. If the caret has not
+    moved -- switching windows, or coming back to one -- nothing does, and the
+    display sits there in the old table showing the old cells. Panning away
+    and back was the manual workaround: it re-renders.
+
+    So invalidate the cached lines and refresh. ``pan_to_cursor=False`` keeps
+    the viewport where the reader left it rather than yanking it to the
+    cursor, and ``stop_flash=False`` lets a flash message finish rather than
+    being cut off by a table change underneath it.
+
+    Reaches into braille._STATE because Orca exposes no public way to drop
+    those caches; guarded accordingly, and a failure only costs the redraw.
+    """
+    try:
+        from orca import braille
+        for line in getattr(braille, "_STATE").lines:
+            try:
+                line.invalidate_cache_internal()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        braille.refresh(pan_to_cursor=False, stop_flash=False)
+        _debug("rerendered braille under the new tables")
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        _debug(f"_rerender_braille: {type(error).__name__}: {error}")
+
+
 def _apply_braille_language(obj, offset=None, source: str = "braille") -> None:
     """Set the braille tables for the line ``obj`` is showing. Never raises.
 
@@ -1280,7 +1312,13 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> None:
         if not detected:
             return
         _debug(f"{source}: detected={detected}")
+        before = (_current_contraction_table, _current_brltty_text_table)
         _switch_language(detected, also_braille=True)
+        if (_current_contraction_table, _current_brltty_text_table) != before:
+            # The tables moved, so whatever is on the display is now rendered
+            # in the wrong one. Nothing else will redraw it if the caret has
+            # not moved.
+            _rerender_braille()
         # Pin this as the focus-line state so the flash hook has a clean
         # snapshot regardless of any speech-time mutations, and so character
         # announcements within this line can read its language.
@@ -2195,6 +2233,36 @@ def _apply_patches():
         except Exception as e:
             log.warning(
                 f"Polyglot: could not patch _update_braille_caret_position: {e}")
+
+        # Switching windows moves no caret, so neither hook above fires and
+        # the display keeps the previous window's table -- sometimes showing
+        # the old caret position in it. Focus changes all funnel through
+        # FocusManager.set_locus_of_focus (window:activate ends in exactly
+        # that call), so hook it and settle the table for whatever is taking
+        # focus.
+        try:
+            from orca import focus_manager
+
+            _original_set_locus = focus_manager.FocusManager.set_locus_of_focus
+
+            def _patched_set_locus(self, event, obj, notify_script=True, force=False):
+                # Before the original, not after: obj is handed to us, and
+                # _container_line reads the line straight off it rather than
+                # asking the focus manager, so nothing has to have settled
+                # first. Doing it first also means the table is right before
+                # Orca brailles the new focus, instead of a beat behind it.
+                #
+                # Non-text focus -- a frame, a button -- returns None from
+                # _container_line and is left alone, so window furniture
+                # cannot drag the table off the content.
+                _apply_braille_language(obj, None, "focus-braille")
+                return _original_set_locus(self, event, obj, notify_script, force)
+
+            _patch(focus_manager.FocusManager, "set_locus_of_focus",
+                   _patched_set_locus)
+            _debug("patched set_locus_of_focus for braille on focus change")
+        except Exception as e:
+            log.warning(f"Polyglot: could not patch set_locus_of_focus: {e}")
     except Exception as e:
         log.warning(f"Polyglot: could not patch update_braille: {e}")
 

@@ -213,6 +213,56 @@ check("a caret move onto a button leaves the table alone",
 check("...and the German table is still the live one",
       si._current_contraction_table, DE_TABLE)
 
+# Changing a table draws nothing by itself: Orca caches each line's rendered
+# form, and with contracted braille on that cache holds the liblouis output.
+# If the caret has not moved -- switching windows, or returning to one -- no
+# rebuild happens and the display sits in the old table showing the old cells.
+# Panning away and back was the manual workaround. So a table change must
+# force a re-render.
+rerenders = []
+si._rerender_braille = lambda: rerenders.append(1)
+
+set_tables("en")
+rerenders.clear()
+braille_caret(TextObj(RUS))
+check("a table change forces a re-render", len(rerenders), 1)
+rerenders.clear()
+braille_caret(TextObj(RUS))
+check("no table change means no re-render", len(rerenders), 0)
+
+# Switching windows moves no caret, so the caret hook never fires. Focus
+# changes funnel through FocusManager.set_locus_of_focus, which is hooked for
+# exactly this: the display must not keep the previous window's table.
+from orca import focus_manager as _fm
+set_locus = _fm.FocusManager.set_locus_of_focus
+check("the focus path is Polyglot's, not Orca's",
+      "_patched_set_locus" in getattr(set_locus, "__qualname__", ""), True)
+
+
+def focus(obj):
+    """Run Orca's focus-change path for obj and report table changes."""
+    applied.clear()
+    try:
+        set_locus(_fm.get_manager(), None, obj)
+    except Exception as error:
+        if not isinstance(error, (AttributeError, TypeError)):
+            raise
+    return list(applied)
+
+
+set_tables("en")
+check("focusing a Russian line switches braille to Russian",
+      RU_TABLE in focus(TextObj(RUS)), True)
+check("...and focusing it again does not switch", focus(TextObj(RUS)), [])
+check("focusing an English line switches back",
+      EN_TABLE in focus(TextObj(ENG)), True)
+# Window furniture is not text and must not drag the table off the content.
+set_tables("ru")
+check("focusing a frame or button leaves the table alone",
+      focus(Button("Close")), [])
+check("...and the Russian table is still live",
+      si._current_contraction_table, RU_TABLE)
+
 set_tables("en")
 check("braille follows a German line", DE_TABLE in braille(TextObj(GER)), True)
 set_tables("de")

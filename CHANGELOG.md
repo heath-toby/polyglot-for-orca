@@ -49,6 +49,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   covers it; LibreOffice overrides `_on_caret_moved` but delegates to `super()`,
   which reaches the same place.
 
+- **A table change drew nothing until something forced a redraw.** Switching the
+  table is not the same as re-rendering: Orca caches each line's rendered form
+  in `Line._info_cache`, and with contracted braille on that cache holds the
+  liblouis output. If the caret had not moved, nothing invalidated it, so the
+  display sat in the old table — sometimes still showing the previous caret
+  position. Panning away and back was the manual workaround, because panning
+  re-renders. Polyglot now invalidates the cached lines and calls
+  `braille.refresh(pan_to_cursor=False, stop_flash=False)` whenever it actually
+  moves a table, so the display corrects itself in place: the viewport stays
+  where the reader left it, and a flash message is not cut off underneath.
+
+- **Switching windows left the previous window's table in place.** A window
+  switch moves no caret, so neither braille hook fired. Focus changes all funnel
+  through `FocusManager.set_locus_of_focus` — `window:activate` ends in exactly
+  that call — so the table is now settled there too, before the original runs,
+  since the object is handed in and the line can be read straight off it. Window
+  furniture is not text, so a frame or a button still returns None from
+  `_container_line` and cannot drag the table off the content.
+
 ### Changed
 
 - `_is_app_ignored` moved from a closure inside the patch installer to module
@@ -57,11 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Tests
 
-- `tests-language-matrix.py` is 48 rows → **55**. Four new rows drive the
-  per-caret-move path rather than `update_braille`, and all four were confirmed
-  to fail with the new hook reverted. Still 55/55 in `markup_text` and `always`,
-  and 48/55 in `markup_only` — the same seven documented mode failures as
-  before, since a bare German line has no script signal to detect.
+- `tests-language-matrix.py` is 48 rows → **63**. New rows drive the
+  per-caret-move path, the focus-change path, and the forced re-render, instead
+  of `update_braille`. Each group was confirmed to fail with its own fix
+  reverted. 63/63 in `markup_text` and `always`, 56/63 in `markup_only` — the
+  same seven documented mode failures as before, since a bare German line has no
+  script signal to detect.
 
 ## [2.8.1] — 2026-10-08
 
