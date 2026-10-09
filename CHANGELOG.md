@@ -57,12 +57,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   position. Panning away and back was the manual workaround, because panning
   re-renders. Polyglot now invalidates the cached lines and calls
   `braille.refresh(pan_to_cursor=False, stop_flash=False)` whenever it actually
-  moves a table, so the display corrects itself in place. It pans to the cursor,
-  which is Orca's own default and load-bearing: a rebuild, or the restore at the
-  end of a flash message, leaves the viewport at the start of the line, and the
-  start of an Orca braille line is the window title and the app name. Not
-  panning parked the display on the window title after every window switch and
-  every flash message. A flash message is not cut off underneath.
+  moves a table, and then asks the active script to **rebuild the line for that
+  object** so the display corrects itself.
+
+  Rebuilding rather than refreshing is the point. `braille.refresh` redraws
+  whatever is in `braille._STATE.lines`, and those lines belong to whatever Orca
+  last brailled — which on a window switch is the *frame*, i.e. the window
+  title. Orca does not necessarily rebuild once focus moves on to the document:
+  measured, 18 seconds passed between focus landing on a Russian paragraph and
+  the next `update_braille`. So refreshing re-asserted the window title in the
+  new table and left it there until the reader panned. Asking the script to
+  rebuild gives the right content, in the right table, panned the way Orca pans
+  it. There is no recursion, because `update_braille` is itself patched and
+  re-enters the shared helper, which finds the table already correct and reports
+  no change.
+
+  Where there is no active script to rebuild with, it falls back to a refresh
+  with `pan_to_cursor=True` — Orca's own default, and load-bearing: a rebuild or
+  a flash-message restore leaves the viewport at the start of the line, and the
+  start of an Orca braille line is the window title and the app name.
+  `stop_flash=False` keeps a flash message from being cut off underneath.
 
 - **Switching windows left the previous window's table in place.** A window
   switch moves no caret, so neither braille hook fired. Focus changes all funnel
@@ -80,13 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Tests
 
-- `tests-language-matrix.py` is 48 rows → **65**. New rows drive the
+- `tests-language-matrix.py` is 48 rows → **71**. New rows drive the
   per-caret-move path, the focus-change path, and the forced re-render, instead
   of `update_braille`. Each group was confirmed to fail with its own fix
-  reverted — including the viewport flag, which has a row of its own. 65/65 in
-  `markup_text` and `always`, 58/65 in `markup_only` — the same seven documented
-  mode failures as before, since a bare German line has no script signal to
-  detect.
+  reverted — including the viewport flag and the rebuild-versus-refresh choice,
+  each of which has rows of its own. 71/71 in `markup_text` and `always`, 64/71
+  in `markup_only` — the same seven documented mode failures as before, since a
+  bare German line has no script signal to detect.
 
 ## [2.8.1] — 2026-10-08
 

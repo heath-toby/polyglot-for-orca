@@ -241,14 +241,73 @@ def _spy_rerender():
 
 si._rerender_braille = _spy_rerender
 
+# A table change must REBUILD the line for the object, not refresh whatever is
+# on the display. Refreshing redraws braille._STATE.lines, which on a window
+# switch still belong to the FRAME -- the window title -- so refreshing
+# re-asserted the title in the new table and it stayed until the reader panned.
+# Measured: 18 seconds between focus landing on a Russian paragraph and Orca's
+# next update_braille, so Orca cannot be relied on to replace it.
+redraws = []
+_real_redraw = si._redraw_braille_for
+
+
+def _spy_redraw(obj):
+    redraws.append(obj)
+
+
+si._redraw_braille_for = _spy_redraw
+
+# The rows above prove the redraw is CALLED for the right object. These prove
+# what it does: rebuild via the active script, not refresh the stale lines.
+# Refreshing was the shipped bug -- on a window switch _STATE.lines still hold
+# the frame's line, so a refresh re-asserted the window title in the new table.
+from orca import script_manager as _sm
+rebuilt = []
+
+
+class _FakeScript:
+    def update_braille(self, obj, **kw):
+        rebuilt.append(obj)
+
+
+_sm.get_manager = lambda: type(
+    "M", (), {"get_active_script": lambda s: _FakeScript()})()
+
+rebuilt.clear()
+rerenders.clear()
+_probe = TextObj(RUS)
+_real_redraw(_probe)
+check("the redraw rebuilds the line via the active script", rebuilt, [_probe])
+check("...and does not fall back to refreshing stale lines", len(rerenders), 0)
+
+# With no active script there is nothing to rebuild with, so it must still
+# re-render -- at least the table will be right.
+_sm.get_manager = lambda: type(
+    "M", (), {"get_active_script": lambda s: None})()
+rebuilt.clear()
+rerenders.clear()
+refresh_calls.clear()
+_real_redraw(TextObj(RUS))
+check("with no active script it falls back to re-rendering", len(rerenders), 1)
+check("...and rebuilds nothing", rebuilt, [])
+check("the fallback pans to the cursor, so the text shows and not the title",
+      refresh_calls[-1].get("pan_to_cursor") if refresh_calls else None, True)
+check("the fallback does not cut a flash message off",
+      refresh_calls[-1].get("stop_flash") if refresh_calls else None, False)
+_sm.get_manager = lambda: type(
+    "M", (), {"get_active_script": lambda s: _FakeScript()})()
+
+
 set_tables("en")
 rerenders.clear()
+redraws.clear()
+rus = TextObj(RUS)
+braille_caret(rus)
+check("a table change redraws, and for the object that changed", redraws, [rus])
+redraws.clear()
 braille_caret(TextObj(RUS))
-check("a table change forces a re-render", len(rerenders), 1)
-check("the re-render pans to the cursor, so the text shows and not the title",
-      refresh_calls[-1].get("pan_to_cursor") if refresh_calls else None, True)
-check("the re-render does not cut a flash message off",
-      refresh_calls[-1].get("stop_flash") if refresh_calls else None, False)
+check("no table change means no redraw", redraws, [])
+
 rerenders.clear()
 braille_caret(TextObj(RUS))
 check("no table change means no re-render", len(rerenders), 0)
@@ -274,8 +333,12 @@ def focus(obj):
 
 
 set_tables("en")
+redraws.clear()
+focus_rus = TextObj(RUS)
 check("focusing a Russian line switches braille to Russian",
-      RU_TABLE in focus(TextObj(RUS)), True)
+      RU_TABLE in focus(focus_rus), True)
+check("...and redraws for it, not for the window title already displayed",
+      redraws, [focus_rus])
 check("...and focusing it again does not switch", focus(TextObj(RUS)), [])
 check("focusing an English line switches back",
       EN_TABLE in focus(TextObj(ENG)), True)

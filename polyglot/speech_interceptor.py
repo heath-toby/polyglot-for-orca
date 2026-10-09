@@ -1263,7 +1263,41 @@ def _rerender_braille() -> None:
         _debug(f"_rerender_braille: {type(error).__name__}: {error}")
 
 
-def _apply_braille_language(obj, offset=None, source: str = "braille") -> None:
+def _redraw_braille_for(obj) -> None:
+    """Rebuild the braille line for ``obj`` under the new tables.
+
+    A plain refresh is the wrong tool here, and that is a bug I shipped once.
+    ``braille.refresh`` redraws whatever is in ``_STATE.lines``, and those
+    lines belong to whatever Orca last brailled -- which on a window switch
+    is the FRAME, i.e. the window title. Orca does not necessarily rebuild
+    after focus moves on to the document: measured, 18 seconds passed between
+    focus landing on a Russian paragraph and the next ``update_braille``. So
+    refreshing re-asserted the window title, now rendered in the Russian
+    table, and it stayed there until the reader panned or moved the caret.
+
+    Asking the active script to rebuild for ``obj`` instead gives the right
+    content, in the right table, panned the way Orca pans it.
+
+    No recursion: ``update_braille`` is patched, so it re-enters
+    ``_apply_braille_language``, which finds the table already correct and
+    reports no change, so nothing redraws a second time.
+    """
+    if obj is not None:
+        try:
+            from orca import script_manager
+            script = script_manager.get_manager().get_active_script()
+            if script is not None:
+                script.update_braille(obj)
+                _debug("redrew braille for the object under the new tables")
+                return
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            _debug(f"_redraw_braille_for: {type(error).__name__}: {error}")
+    # No script, or the rebuild failed: fall back to re-rendering what is
+    # there, which is at least in the right table.
+    _rerender_braille()
+
+
+def _apply_braille_language(obj, offset=None, source: str = "braille") -> bool:
     """Set the braille tables for the line ``obj`` is showing. Never raises.
 
     This is the one owner of the braille tables. It is deliberately NOT on the
@@ -1287,7 +1321,7 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> None:
         mode = _config.detection_mode if _config else "markup_text"
         if not (_config and _config.enabled and _detector and obj is not None
                 and not _is_app_ignored() and mode != "off"):
-            return
+            return False
         # Resolved the same way the speech path resolves it, which gates on
         # the object actually being text. It was previously asked for a line
         # from whatever it was handed -- a frame, a label -- and the English
@@ -1296,7 +1330,7 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> None:
         # German document, this logged en, de, en, de in a second.
         text = _container_line(obj, offset)
         if not text:
-            return
+            return False
         detected = None
         # Prefer obj-locale (markup signal) in non-always modes.
         if mode != "always":
@@ -1322,21 +1356,21 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> None:
             else:
                 detected = _detector.detect(text)
         if not detected:
-            return
+            return False
         _debug(f"{source}: detected={detected}")
         before = (_current_contraction_table, _current_brltty_text_table)
         _switch_language(detected, also_braille=True)
-        if (_current_contraction_table, _current_brltty_text_table) != before:
-            # The tables moved, so whatever is on the display is now rendered
-            # in the wrong one. Nothing else will redraw it if the caret has
-            # not moved.
-            _rerender_braille()
+        # Report whether the tables moved; the caller decides what to redraw,
+        # because only the caller knows which object the display should be
+        # showing by the time it is done.
+        return (_current_contraction_table, _current_brltty_text_table) != before
         # Pin this as the focus-line state so the flash hook has a clean
         # snapshot regardless of any speech-time mutations, and so character
         # announcements within this line can read its language.
         _record_focus_line_state()
     except Exception as error:  # pylint: disable=broad-exception-caught
         _debug(f"{source} pre: ERROR {type(error).__name__}: {error}")
+    return False
 
 
 def _language_of_line(text: str) -> str | None:
@@ -2236,8 +2270,17 @@ def _apply_patches():
                     pass
                 # Before the original, so the table is in place whether Orca
                 # repositions the cursor and refreshes, or rebuilds the line.
-                _apply_braille_language(obj, None, "caret-braille")
-                return _original_caret_braille(self, obj)
+                changed = _apply_braille_language(obj, None, "caret-braille")
+                try:
+                    return _original_caret_braille(self, obj)
+                finally:
+                    # Orca may have taken its reposition fast path, which
+                    # redraws the line from caches rendered in the old table.
+                    # In a finally because once the table has moved the
+                    # display is wrong until something redraws it, however
+                    # the original turned out.
+                    if changed:
+                        _redraw_braille_for(obj)
 
             _patch(DefaultScript, "_update_braille_caret_position",
                    _patched_caret_braille)
@@ -2267,8 +2310,20 @@ def _apply_patches():
                 # Non-text focus -- a frame, a button -- returns None from
                 # _container_line and is left alone, so window furniture
                 # cannot drag the table off the content.
-                _apply_braille_language(obj, None, "focus-braille")
-                return _original_set_locus(self, event, obj, notify_script, force)
+                changed = _apply_braille_language(obj, None, "focus-braille")
+                try:
+                    return _original_set_locus(
+                        self, event, obj, notify_script, force)
+                finally:
+                    # This is the window-switch case, and it is why the
+                    # redraw rebuilds for obj rather than refreshing: at this
+                    # point the display is still showing the FRAME's line --
+                    # the window title -- and Orca will not necessarily
+                    # replace it. Measured: 18 seconds between focus landing
+                    # on a Russian paragraph and the next update_braille.
+                    # In a finally for the same reason as the caret hook.
+                    if changed:
+                        _redraw_braille_for(obj)
 
             _patch(focus_manager.FocusManager, "set_locus_of_focus",
                    _patched_set_locus)
