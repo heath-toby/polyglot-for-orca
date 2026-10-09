@@ -49,9 +49,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hook, and extracting the body left it stranded past the new return. 2.8.1 and
   earlier are unaffected.
 
+- **The table came back, but the cells on the display did not.** Contracted
+  braille is on, so every line caches the liblouis output it was translated
+  into, and changing the table re-translates nothing. Orca drops those caches
+  on its own restore paths — `_flash_callback`, and `kill_flash` with
+  `restore_saved=True` — but `_prepare_refresh` kills the flash with
+  `restore_saved=False` on *every* `refresh(stop_flash=True)`, and that path
+  invalidates nothing. So the table was right and the cells were still the
+  flash language's.
+
+  Nothing rebuilt them afterwards either. In a document being read rather than
+  edited, Orca does not call `update_braille` again for a long time, and a
+  caret move inside the same object is answered by `try_reposition_cursor`
+  straight from the cache:
+
+  ```python
+  if braille.try_reposition_cursor(obj):
+      return          # no rebuild, no re-translation
+  self.update_braille(obj)
+  ```
+
+  That is why moving the cursor did not help. The restore now drops the cached
+  translation of every line on the display when it moves the table, and not
+  when it doesn't — an English message on an English line should not cost a
+  re-translation of the whole display.
+
+- **The redraw was gated on the wrong thing, and the log now says so.** The
+  table being already correct was taken to mean the display was already
+  correct. It does not: the cells may have been translated under a different
+  table, or belong to another line. Diagnosing that from Polyglot's own log
+  twice produced the wrong answer, because what Orca has on the display cannot
+  be deduced from what Polyglot did. With `ORCA_POLYGLOT_DEBUG=1` the log now
+  records, at each point where a redraw was considered and declined, which line
+  Orca is showing, whether a flash is up, and which table the cells were
+  translated under — plus which flash hook fired and whether the restore ran or
+  was skipped and why.
+
 ### Tests
 
-- 71 → 85 rows. The new ones pin the focus-line snapshot on all three paths
+- 71 → 88 rows. The new ones pin the focus-line snapshot on all three paths
   (caret move, focus change, rebuild), drive the flash round trip and assert the
   line's tables come back, keep the two guards that must not restore (a new line
   rendered during the flash, and no flash in progress), check the three
@@ -59,6 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unreachable statement in the module. Verified by restoring the 2.8.2 ordering:
   seven rows fail, including the symptom itself — the Russian line left in
   `en-ueb-g2` after the flash.
+- Three more for the cache: the restore drops the cached translation of every
+  displayed line when it moves the table, drops nothing when it doesn't, and
+  the row covering the first case fails if the invalidation is removed.
 - The harness's stand-in for `_set_contraction_table` now carries BRLTTY's text
   table along with it, the way the real one does. Without that the text table
   never moved under test, so the rows reading it would have passed whatever the

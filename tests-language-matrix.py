@@ -411,6 +411,44 @@ check("...and BRLTTY's text table goes with it, both ways",
 check("...and the flash state is cleared, so the next one saves afresh",
       si._in_flash, False)
 
+# Putting the table back is not enough. With contracted braille on -- which
+# it is on his machine -- each line caches the liblouis output it was
+# translated into, and changing the table re-translates nothing. Orca drops
+# those caches on its own restore paths, but _prepare_refresh kills the flash
+# with restore_saved=False on every refresh(stop_flash=True), and that path
+# invalidates nothing: the table is right and the cells are still the flash
+# language's. Nothing rebuilds afterwards either -- a caret move inside the
+# same object is answered by try_reposition_cursor straight from the cache,
+# which is "cursor movement doesn't trigger the refresh".
+class _FakeLine:
+    def __init__(self): self.dropped = 0
+    def invalidate_cache_internal(self): self.dropped += 1
+
+
+_lines = [_FakeLine(), _FakeLine()]
+_braille._STATE.lines = _lines
+set_tables("en")
+braille_caret(TextObj(RUS))
+si._save_pre_flash_state()
+si._switch_to_default_braille_tables()
+si._restore_pre_flash_state()
+check("the restore drops the cells translated under the flash's table",
+      [l.dropped for l in _lines], [1, 1])
+
+# ...and does not drop them when the table never moved, or every flash
+# message would cost a re-translation of the whole display for nothing.
+_lines = [_FakeLine(), _FakeLine()]
+_braille._STATE.lines = _lines
+set_tables("en")
+braille(TextObj(ENG))
+si._save_pre_flash_state()
+si._switch_to_default_braille_tables()
+check("an English flash on an English line moves no table",
+      si._current_contraction_table, EN_TABLE)
+si._restore_pre_flash_state()
+check("...so the restore drops nothing", [l.dropped for l in _lines], [0, 0])
+_braille._STATE.lines = []
+
 # The two guards that must survive: a flash that ends somewhere else.
 set_tables("en")
 braille_caret(TextObj(RUS))

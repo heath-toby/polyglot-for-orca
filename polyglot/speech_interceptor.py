@@ -1252,15 +1252,71 @@ def _rerender_braille() -> None:
     """
     try:
         from orca import braille
+        _invalidate_displayed_lines()
+        braille.refresh(pan_to_cursor=True, stop_flash=False)
+        _debug("rerendered braille under the new tables")
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        _debug(f"_rerender_braille: {type(error).__name__}: {error}")
+
+
+def _invalidate_displayed_lines() -> None:
+    """Drop the cached translation of every line on the display.
+
+    With contracted braille on -- which it is here -- each line caches the
+    liblouis output it was translated into. Changing the table does not
+    re-translate anything, so the cache has to be dropped or the display
+    keeps showing cells produced by the previous table. The caller refreshes;
+    this only drops.
+
+    Reaches into braille._STATE because Orca exposes no public way to drop
+    those caches; guarded accordingly, and a failure only costs the redraw.
+    """
+    try:
+        from orca import braille
         for line in getattr(braille, "_STATE").lines:
             try:
                 line.invalidate_cache_internal()
             except Exception:  # pylint: disable=broad-exception-caught
                 pass
-        braille.refresh(pan_to_cursor=True, stop_flash=False)
-        _debug("rerendered braille under the new tables")
     except Exception as error:  # pylint: disable=broad-exception-caught
-        _debug(f"_rerender_braille: {type(error).__name__}: {error}")
+        _debug(f"_invalidate_displayed_lines: {type(error).__name__}: {error}")
+
+
+def _describe_display(source: str) -> None:
+    """Log what Orca actually has on the braille display.
+
+    Inference from the absence of log lines got the diagnosis wrong twice.
+    The three things that matter cannot be deduced from Polyglot's own
+    behaviour: which line Orca is showing, whether a flash message is up,
+    and which table the cells on the display were translated under. This
+    says so outright. Debug builds only, and it costs nothing when the log
+    is off.
+    """
+    if not _DEBUG_ENABLED:
+        return
+    try:
+        from orca import braille
+        state = getattr(braille, "_STATE")
+        lines = state.lines
+        viewport = tuple(state.viewport)
+        shown = "<no lines>"
+        if lines:
+            index = viewport[1] if viewport[1] < len(lines) else 0
+            try:
+                shown = lines[index].get_line_info()[0][:60]
+            except Exception:  # pylint: disable=broad-exception-caught
+                try:
+                    shown = "".join(
+                        getattr(r, "string", "") or ""
+                        for r in lines[index].get_regions())[:60]
+                except Exception:  # pylint: disable=broad-exception-caught
+                    shown = "<unreadable>"
+        _debug(f"display[{source}]: lines={len(lines)} viewport={viewport} "
+               f"flash={braille.is_flash_active()} "
+               f"table={os.path.basename(_current_contraction_table or '')} "
+               f"showing={shown!r}")
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        _debug(f"_describe_display: {type(error).__name__}: {error}")
 
 
 def _redraw_braille_for(obj) -> None:
@@ -1538,10 +1594,29 @@ def _restore_pre_flash_state() -> None:
         and _focus_line_brltty_text_table == _pre_flash_focus_brltty
     )
     if tables_still_flash_default and focus_line_unchanged:
+        before = _current_contraction_table
         if _pre_flash_focus_contraction is not None:
             _set_contraction_table(_pre_flash_focus_contraction)
         if _pre_flash_focus_brltty is not None:
             _set_brltty_text_table(_pre_flash_focus_brltty)
+        if _current_contraction_table != before:
+            # The cells on the display were translated under the flash's
+            # table. Orca drops the line caches on its own restore paths
+            # (_flash_callback, and kill_flash with restore_saved=True) --
+            # but _prepare_refresh kills the flash with restore_saved=False
+            # on every refresh(stop_flash=True), and that path invalidates
+            # nothing. The table would be right and the cells still wrong,
+            # with no rebuild in sight: in a document being read rather than
+            # edited, Orca does not call update_braille again for a long
+            # time, and a caret move inside the same object is answered by
+            # try_reposition_cursor from the cache.
+            _invalidate_displayed_lines()
+            _debug("flash restore: dropped the line caches, "
+                   "cells were translated under the flash table")
+    else:
+        _debug(f"flash restore: skipped "
+               f"(flash_default={tables_still_flash_default} "
+               f"focus_line_unchanged={focus_line_unchanged})")
     _in_flash = False
     _pre_flash_focus_contraction = None
     _pre_flash_focus_brltty = None
@@ -2286,6 +2361,8 @@ def _apply_patches():
                     # the original turned out.
                     if changed:
                         _redraw_braille_for(obj)
+                    else:
+                        _describe_display("caret, no table change")
 
             _patch(DefaultScript, "_update_braille_caret_position",
                    _patched_caret_braille)
@@ -2329,6 +2406,8 @@ def _apply_patches():
                     # In a finally for the same reason as the caret hook.
                     if changed:
                         _redraw_braille_for(obj)
+                    else:
+                        _describe_display("focus, no table change")
 
             _patch(focus_manager.FocusManager, "set_locus_of_focus",
                    _patched_set_locus)
@@ -2356,6 +2435,9 @@ def _apply_patches():
         def _patched_display_message(message, flash_time=0):
             try:
                 if _config and _config.enabled:
+                    _debug(f"flash: display_message flash_time={flash_time} "
+                           f"message={message[:40]!r}")
+                    _describe_display("before flash")
                     _save_pre_flash_state()
                     _switch_to_default_braille_tables()
             except Exception as e:
@@ -2369,10 +2451,14 @@ def _apply_patches():
                 # line content using whichever tables are currently
                 # active.
                 if _config and _config.enabled:
+                    _debug("flash: timed out")
                     _restore_pre_flash_state()
             except Exception as e:
                 _debug(f"flash_callback pre: ERROR {e}")
-            return _original_flash_callback()
+            try:
+                return _original_flash_callback()
+            finally:
+                _describe_display("after flash timeout")
 
         def _patched_kill_flash(restore_saved=True):
             # We always restore (regardless of restore_saved). When the
@@ -2385,10 +2471,14 @@ def _apply_patches():
             # rather than letting the flash's tables stick.
             try:
                 if _config and _config.enabled:
+                    _debug(f"flash: killed, restore_saved={restore_saved}")
                     _restore_pre_flash_state()
             except Exception as e:
                 _debug(f"kill_flash pre: ERROR {e}")
-            return _original_kill_flash(restore_saved)
+            try:
+                return _original_kill_flash(restore_saved)
+            finally:
+                _describe_display(f"after kill_flash({restore_saved})")
 
         _patch(braille, "display_message", _patched_display_message)
         _patch(braille, "_flash_callback", _patched_flash_callback)
