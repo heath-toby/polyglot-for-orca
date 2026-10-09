@@ -117,15 +117,35 @@ check("names locale follows the language", si._current_names_locale, "en")
 from orca.scripts.default import Script as DefaultScript
 applied = []
 
+brltty_applied = []
+
+def _fake_set_brltty_text_table(lang_code):
+    # There is no braille display on the end of this process, so the real
+    # setter gives up on its first call and leaves the value at None for the
+    # rest of the run. Rows that read it would then pass for the wrong reason.
+    if lang_code != si._current_brltty_text_table:
+        brltty_applied.append(lang_code)
+        si._current_brltty_text_table = lang_code
+
 def _fake_set_contraction_table(path):
     # Mimics the real function's early return, or a repeat call would look
     # like a switch when in fact nothing happens.
-    if path != si._current_contraction_table:
-        applied.append(path)
-        si._current_contraction_table = path
+    if path == si._current_contraction_table:
+        return
+    applied.append(path)
+    si._current_contraction_table = path
+    # ...and mimics its one side effect: the real one carries BRLTTY's text
+    # table along with it, deriving the language from the table's name, and
+    # skips the braille-only tables that name no language. Leaving that out
+    # meant the text table never moved here, so the flash-restore rows below
+    # had nothing to restore and said nothing.
+    name = os.path.splitext(os.path.basename(path))[0]
+    if "IPA" in name or name.startswith("unicode-braille"):
+        return
+    si._set_brltty_text_table(name.split("-")[0])
 
 si._set_contraction_table = _fake_set_contraction_table
-si._set_brltty_text_table = lambda code: None
+si._set_brltty_text_table = _fake_set_brltty_text_table
 DE_TABLE = "/usr/share/liblouis/tables/de-g1-detailed.ctb"
 EN_TABLE = "/usr/share/liblouis/tables/en-ueb-g2.ctb"
 RU_TABLE = "/usr/share/liblouis/tables/ru-litbrl-detailed.ctb"
@@ -348,6 +368,94 @@ check("focusing a frame or button leaves the table alone",
       focus(Button("Close")), [])
 check("...and the Russian table is still live",
       si._current_contraction_table, RU_TABLE)
+
+# --- the focus-line snapshot, and the flash messages that depend on it ----
+# A flash message ("Focus mode", the time, a notification) is rendered in the
+# default language's tables, then the focus line's tables are put back when
+# the flash ends. The restore reads a snapshot taken when the line was last
+# brailled -- and in 2.8.2 the call that takes that snapshot sat AFTER the
+# return that reports whether the tables moved, so it never ran. The snapshot
+# stayed None, the restore had nothing to restore to, and the display was left
+# in English on a Russian line until some unrelated edit rebuilt it. From his
+# log: focus lands on a Russian paragraph at 11:51:18, "Focus mode" takes the
+# tables to en-ueb-g2 in the same second, and nothing takes them back.
+#
+# The first row is the whole bug: the snapshot has to actually be written.
+set_tables("en")
+braille_caret(TextObj(RUS))
+check("reading a line pins it as the focus line",
+      si._focus_line_contraction_table, RU_TABLE)
+set_tables("en")
+focus(TextObj(RUS))
+check("the focus path pins it too", si._focus_line_contraction_table, RU_TABLE)
+set_tables("en")
+braille(TextObj(RUS))
+check("the rebuild path pins it too",
+      si._focus_line_contraction_table, RU_TABLE)
+
+# And the round trip it exists for.
+set_tables("en")
+braille_caret(TextObj(RUS))
+check("...and pins BRLTTY's text table with it",
+      si._focus_line_brltty_text_table, "ru")
+si._save_pre_flash_state()
+brltty_applied.clear()
+si._switch_to_default_braille_tables()
+check("a flash message is rendered in the default language's table",
+      si._current_contraction_table, EN_TABLE)
+si._restore_pre_flash_state()
+check("when the flash ends, the line's own table comes back",
+      si._current_contraction_table, RU_TABLE)
+check("...and BRLTTY's text table goes with it, both ways",
+      brltty_applied, ["en", "ru"])
+check("...and the flash state is cleared, so the next one saves afresh",
+      si._in_flash, False)
+
+# The two guards that must survive: a flash that ends somewhere else.
+set_tables("en")
+braille_caret(TextObj(RUS))
+si._save_pre_flash_state()
+si._switch_to_default_braille_tables()
+braille_caret(TextObj(GER))          # a new line rendered during the flash
+_during = si._current_contraction_table
+si._restore_pre_flash_state()
+check("a line rendered during the flash is not undone by the restore",
+      si._current_contraction_table, _during)
+# Nothing saved means nothing to restore, and in particular not a crash.
+si._in_flash = False
+si._restore_pre_flash_state()
+check("restoring with no flash in progress does nothing",
+      si._current_contraction_table, _during)
+
+# The lifecycle hooks the restore hangs off. Without these the rows above
+# prove a mechanism nothing calls.
+check("display_message is Polyglot's, so a flash saves the line's tables",
+      "_patched_display_message" in getattr(
+          _braille.display_message, "__qualname__", ""), True)
+check("the flash timeout is Polyglot's, so the tables come back",
+      "_patched_flash_callback" in getattr(
+          _braille._flash_callback, "__qualname__", ""), True)
+check("kill_flash is Polyglot's, so an interrupted flash restores too",
+      "_patched_kill_flash" in getattr(
+          _braille.kill_flash, "__qualname__", ""), True)
+
+# The shape of the bug, not just this instance of it. A statement after a
+# return is silent in Python: no warning, no error, and the tests above it
+# all passed. This row fails on any unreachable statement anywhere in the
+# module, which is the only reason it is worth having.
+import ast as _ast
+_tree = _ast.parse(open(si.__file__, encoding="utf-8").read())
+_dead = []
+for _node in _ast.walk(_tree):
+    for _field in ("body", "orelse", "finalbody"):
+        _body = getattr(_node, _field, None)
+        if not isinstance(_body, list):
+            continue
+        for _i, _stmt in enumerate(_body[:-1]):
+            if isinstance(_stmt, (_ast.Return, _ast.Raise,
+                                  _ast.Continue, _ast.Break)):
+                _dead.append(_body[_i + 1].lineno)
+check("no statement in the interceptor sits after a return", _dead, [])
 
 set_tables("en")
 check("braille follows a German line", DE_TABLE in braille(TextObj(GER)), True)

@@ -5,6 +5,65 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.3] — 2026-10-09
+
+### Fixed
+
+- **A flash message left the display in the wrong language, and nothing put it
+  back.** Focus a Russian paragraph and Orca says "Focus mode"; the message is
+  English, so the display is switched into the English tables to render it —
+  correctly. When the message ends, the line's own tables are supposed to come
+  back. They did not. The Russian line stayed in English contraction until some
+  unrelated event rebuilt it, which in a document being read rather than edited
+  can be a very long time. From the debug log, focus landing on a Russian
+  paragraph at 11:51:18 and the tables going to `en-ueb-g2` in the same second,
+  with nothing taking them back:
+
+  ```
+  11:51:18 focus-braille: detected=ru
+  11:51:18 _switch_language: en -> ru (also_braille=True)
+  11:51:18 _speak: text='Focus mode' detected=en
+  11:51:18 _set_contraction_table: ru-litbrl-detailed.utb -> en-ueb-g2.ctb
+  ```
+
+  The restore reads a snapshot of the focus line's tables, taken by
+  `_record_focus_line_state()` when the line was last brailled. In 2.8.2 that
+  call sat **after** the `return` that reports whether the tables moved:
+
+  ```python
+  return (_current_contraction_table, _current_brltty_text_table) != before
+  _record_focus_line_state()   # never runs
+  ```
+
+  So the snapshot was never written. It stayed `None`, the restore found nothing
+  to restore to and did nothing, and the flash's English tables simply stuck.
+
+  The call now happens before the return. Python says nothing about a statement
+  after a `return` — no warning, no error — and every test passed, because the
+  rows covering the flash lifecycle asserted the tables after a *rebuild*, which
+  still worked. The suite now fails on any unreachable statement anywhere in the
+  interceptor, which is the only reliable guard against this shape of mistake.
+
+  This was introduced in 2.8.2 when the three braille hooks were given a shared
+  decision function; the snapshot was taken inside the old inline `update_braille`
+  hook, and extracting the body left it stranded past the new return. 2.8.1 and
+  earlier are unaffected.
+
+### Tests
+
+- 71 → 85 rows. The new ones pin the focus-line snapshot on all three paths
+  (caret move, focus change, rebuild), drive the flash round trip and assert the
+  line's tables come back, keep the two guards that must not restore (a new line
+  rendered during the flash, and no flash in progress), check the three
+  lifecycle hooks the restore hangs off are actually patched, and fail on any
+  unreachable statement in the module. Verified by restoring the 2.8.2 ordering:
+  seven rows fail, including the symptom itself — the Russian line left in
+  `en-ueb-g2` after the flash.
+- The harness's stand-in for `_set_contraction_table` now carries BRLTTY's text
+  table along with it, the way the real one does. Without that the text table
+  never moved under test, so the rows reading it would have passed whatever the
+  restore asked for.
+
 ## [2.8.2] — 2026-10-09
 
 ### Fixed

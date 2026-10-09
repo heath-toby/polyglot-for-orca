@@ -11,7 +11,7 @@ editing. The venv, custom character names and debug log live outside the
 package for exactly that reason -- see ``speech_interceptor._DATA_DIR``.
 """
 
-__version__ = "2.8.2"
+__version__ = "2.8.3"
 
 import logging
 
@@ -48,7 +48,7 @@ class Polyglot(Extension):
 
     GROUP_LABEL = "Polyglot"
     DESCRIPTION = "Detects the language of text as Orca speaks it and switches voice and braille contraction table to match, and announces emoji, emoticons and Unicode characters by name."
-    VERSION = "2.8.2"  # keep in sync with __version__; read by AST, must be a literal
+    VERSION = "2.8.3"  # keep in sync with __version__; read by AST, must be a literal
     AUTHOR = "Toby"
 
     def __init__(self) -> None:

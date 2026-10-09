@@ -1360,14 +1360,19 @@ def _apply_braille_language(obj, offset=None, source: str = "braille") -> bool:
         _debug(f"{source}: detected={detected}")
         before = (_current_contraction_table, _current_brltty_text_table)
         _switch_language(detected, also_braille=True)
+        # Pin this as the focus-line state so the flash hook has a clean
+        # snapshot regardless of any speech-time mutations, and so character
+        # announcements within this line can read its language. This must
+        # happen before the return below -- it sat after it from 2.8.2 until
+        # 2.8.3, which left the snapshot at None, so a flash message switched
+        # the tables to the default language and nothing ever switched them
+        # back. Reading a Russian line and being told "Focus mode" left the
+        # display in English until some unrelated edit rebuilt the line.
+        _record_focus_line_state()
         # Report whether the tables moved; the caller decides what to redraw,
         # because only the caller knows which object the display should be
         # showing by the time it is done.
         return (_current_contraction_table, _current_brltty_text_table) != before
-        # Pin this as the focus-line state so the flash hook has a clean
-        # snapshot regardless of any speech-time mutations, and so character
-        # announcements within this line can read its language.
-        _record_focus_line_state()
     except Exception as error:  # pylint: disable=broad-exception-caught
         _debug(f"{source} pre: ERROR {type(error).__name__}: {error}")
     return False
