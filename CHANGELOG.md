@@ -57,8 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   position. Panning away and back was the manual workaround, because panning
   re-renders. Polyglot now invalidates the cached lines and calls
   `braille.refresh(pan_to_cursor=False, stop_flash=False)` whenever it actually
-  moves a table, so the display corrects itself in place: the viewport stays
-  where the reader left it, and a flash message is not cut off underneath.
+  moves a table, so the display corrects itself in place. It pans to the cursor,
+  which is Orca's own default and load-bearing: a rebuild, or the restore at the
+  end of a flash message, leaves the viewport at the start of the line, and the
+  start of an Orca braille line is the window title and the app name. Not
+  panning parked the display on the window title after every window switch and
+  every flash message. A flash message is not cut off underneath.
 
 - **Switching windows left the previous window's table in place.** A window
   switch moves no caret, so neither braille hook fired. Focus changes all funnel
@@ -76,12 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Tests
 
-- `tests-language-matrix.py` is 48 rows → **63**. New rows drive the
+- `tests-language-matrix.py` is 48 rows → **65**. New rows drive the
   per-caret-move path, the focus-change path, and the forced re-render, instead
   of `update_braille`. Each group was confirmed to fail with its own fix
-  reverted. 63/63 in `markup_text` and `always`, 56/63 in `markup_only` — the
-  same seven documented mode failures as before, since a bare German line has no
-  script signal to detect.
+  reverted — including the viewport flag, which has a row of its own. 65/65 in
+  `markup_text` and `always`, 58/65 in `markup_only` — the same seven documented
+  mode failures as before, since a bare German line has no script signal to
+  detect.
 
 ## [2.8.1] — 2026-10-08
 

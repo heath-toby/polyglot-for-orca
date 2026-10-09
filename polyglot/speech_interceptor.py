@@ -1230,10 +1230,22 @@ def _rerender_braille() -> None:
     display sits there in the old table showing the old cells. Panning away
     and back was the manual workaround: it re-renders.
 
-    So invalidate the cached lines and refresh. ``pan_to_cursor=False`` keeps
-    the viewport where the reader left it rather than yanking it to the
-    cursor, and ``stop_flash=False`` lets a flash message finish rather than
-    being cut off by a table change underneath it.
+    So invalidate the cached lines and refresh.
+
+    ``pan_to_cursor=True``, which is Orca's own default everywhere else, and
+    it is load-bearing. It was briefly False, on the idea that leaving the
+    viewport alone was the polite thing to do -- but at the moment a table
+    changes the viewport is NOT where the reader left it. A rebuild, or the
+    restore at the end of a flash message, puts it back at the start of the
+    line, and the start of an Orca braille line is the window title and the
+    app name. False therefore parked the display on the window title after
+    every window switch and after every flash message, and the only way back
+    to the text was to pan several lines. Panning cannot be disturbed by
+    panning to the cursor here, because panning moves no caret, so no table
+    changes and this never runs.
+
+    ``stop_flash=False`` lets a flash message finish rather than being cut
+    off by a table change underneath it.
 
     Reaches into braille._STATE because Orca exposes no public way to drop
     those caches; guarded accordingly, and a failure only costs the redraw.
@@ -1245,7 +1257,7 @@ def _rerender_braille() -> None:
                 line.invalidate_cache_internal()
             except Exception:  # pylint: disable=broad-exception-caught
                 pass
-        braille.refresh(pan_to_cursor=False, stop_flash=False)
+        braille.refresh(pan_to_cursor=True, stop_flash=False)
         _debug("rerendered braille under the new tables")
     except Exception as error:  # pylint: disable=broad-exception-caught
         _debug(f"_rerender_braille: {type(error).__name__}: {error}")

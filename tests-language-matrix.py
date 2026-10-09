@@ -219,13 +219,36 @@ check("...and the German table is still the live one",
 # rebuild happens and the display sits in the old table showing the old cells.
 # Panning away and back was the manual workaround. So a table change must
 # force a re-render.
+# Spy on the real _rerender_braille's call into Orca, so the flags it passes
+# are asserted rather than assumed. pan_to_cursor is load-bearing: it was
+# briefly False, which parked the display on the window title after every
+# window switch and every flash message, because a rebuild or a flash restore
+# leaves the viewport at the start of the line -- and the start of an Orca
+# braille line is the window title and the app name.
+from orca import braille as _braille
+refresh_calls = []
+_braille.refresh = lambda **kw: refresh_calls.append(kw)
+_braille._STATE.lines = []
+
 rerenders = []
-si._rerender_braille = lambda: rerenders.append(1)
+_real_rerender = si._rerender_braille
+
+
+def _spy_rerender():
+    rerenders.append(1)
+    _real_rerender()
+
+
+si._rerender_braille = _spy_rerender
 
 set_tables("en")
 rerenders.clear()
 braille_caret(TextObj(RUS))
 check("a table change forces a re-render", len(rerenders), 1)
+check("the re-render pans to the cursor, so the text shows and not the title",
+      refresh_calls[-1].get("pan_to_cursor") if refresh_calls else None, True)
+check("the re-render does not cut a flash message off",
+      refresh_calls[-1].get("stop_flash") if refresh_calls else None, False)
 rerenders.clear()
 braille_caret(TextObj(RUS))
 check("no table change means no re-render", len(rerenders), 0)
