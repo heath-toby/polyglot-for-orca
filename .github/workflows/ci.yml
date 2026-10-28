@@ -33,52 +33,27 @@ jobs:
         run: ruff check polyglot tests-language-matrix.py || true
 
   import-check:
-    name: import against Orca ${{ matrix.orca }}
+    name: import against Orca master
+    # Polyglot targets Orca 51+ (uses gsettings_registry and the new Extension
+    # system). Ubuntu's apt-shipped Orca is older than that, so there is no
+    # stable version worth testing against today. If a distro ever ships 51+
+    # we can add it back as a matrix entry.
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Orca shipped by the current Ubuntu LTS — the version most users
-          # we would hear from have today. A regression here is a real one.
-          - orca: stable
-            source: apt
-            allow_failure: false
-          # Orca upstream master — Toby's own setup and the next LTS. A
-          # regression here is an early warning that an upstream API has
-          # moved under us (as happened with update_braille / terminal
-          # subclass in Orca 51). Allowed to fail; a maintainer looks.
-          - orca: master
-            source: git
-            allow_failure: true
-    continue-on-error: ${{ matrix.allow_failure }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: system deps (Orca + accessibility stack)
+      - name: system deps (accessibility typelibs + louis)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            python3-gi gir1.2-atspi-2.0 python3-louis \
+            python3-gi python3-louis \
+            gir1.2-atspi-2.0 gir1.2-atk-1.0 gir1.2-glib-2.0 \
             at-spi2-core libatspi2.0-dev
 
-      - name: install Orca (stable from apt)
-        if: matrix.source == 'apt'
-        run: |
-          sudo apt-get install -y --no-install-recommends orca
-          # apt installs Orca's Python package to /usr/lib/python3/dist-packages,
-          # which the actions/setup-python runtime does not see by default.
-          # Hard-code the location rather than globbing: on Ubuntu LTS this
-          # path is stable and shared across Python minor versions. If it
-          # ever moves, the import step will fail with a clear error and
-          # we fix it here.
-          echo "PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH" >> "$GITHUB_ENV"
-
       - name: install Orca (master from git)
-        if: matrix.source == 'git'
         run: |
           git clone --depth 1 https://gitlab.gnome.org/GNOME/orca.git /tmp/orca
           # Orca's build system uses meson; for an import-only test it's
