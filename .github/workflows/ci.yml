@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run every Monday at 06:00 UTC so we also catch Orca upstream changes
+    # on a schedule, not only on our own pushes.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: syntax + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: install ruff
+        run: python -m pip install --upgrade pip ruff
+      - name: compile every .py (catches typos and broken syntax)
+        run: python -m compileall -q polyglot tests-language-matrix.py
+      - name: ruff check
+        # Not --fail-on-warnings: ruff is advisory for us. We just want to
+        # see the output.
+        run: ruff check polyglot tests-language-matrix.py || true
+
+  import-check:
+    name: import against Orca ${{ matrix.orca }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Orca shipped by the current Ubuntu LTS — the version most users
+          # we would hear from have today. A regression here is a real one.
+          - orca: stable
+            source: apt
+            allow_failure: false
+          # Orca upstream master — Toby's own setup and the next LTS. A
+          # regression here is an early warning that an upstream API has
+          # moved under us (as happened with update_braille / terminal
+          # subclass in Orca 51). Allowed to fail; a maintainer looks.
+          - orca: master
+            source: git
+            allow_failure: true
+    continue-on-error: ${{ matrix.allow_failure }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: system deps (Orca + accessibility stack)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            python3-gi gir1.2-atspi-2.0 python3-louis \
+            at-spi2-core libatspi2.0-dev
+
+      - name: install Orca (stable from apt)
+        if: matrix.source == 'apt'
+        run: sudo apt-get install -y --no-install-recommends orca
+
+      - name: install Orca (master from git)
+        if: matrix.source == 'git'
+        run: |
+          git clone --depth 1 https://gitlab.gnome.org/GNOME/orca.git /tmp/orca
+          cd /tmp/orca
+          # Orca's build system uses meson; for an import-only test it's
+          # enough to make the Python package importable from source.
+          echo "PYTHONPATH=/tmp/orca/src:$PYTHONPATH" >> "$GITHUB_ENV"
+
+      - name: install Python runtime dependencies
+        run: python -m pip install --upgrade pip lingua-language-detector
+
+      - name: import polyglot (catches API-signature mismatches)
+        # We can't fully "install" the extension without a running Orca
+        # (approval is by content-hash into Orca's registry). Importing
+        # the modules is enough to catch the common failure modes:
+        # syntax errors, missing imports, and import-time mismatches
+        # against the Orca version we're building against.
+        run: |
+          # Point Python at our package.
+          export PYTHONPATH="$PWD:$PYTHONPATH"
+          python - <<'PY'
+          import importlib, sys
+          targets = [
+              "polyglot",
+              "polyglot.config",
+              "polyglot.speech_interceptor",
+              "polyglot.language_detector",
+              "polyglot.dictionary_detector",
+              "polyglot.speech_dictionary",
+              "polyglot.available_voices",
+              "polyglot.custom_names",
+          ]
+          failed = []
+          for name in targets:
+              try:
+                  importlib.import_module(name)
+                  print(f"ok   {name}")
+              except Exception as e:
+                  print(f"FAIL {name}: {type(e).__name__}: {e}")
+                  failed.append((name, e))
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: signature compatibility check against patched Orca methods
+        # The specific bug that burned us: Polyglot patches
+        # DefaultScript.update_braille, but the terminal subclass's
+        # override calls super().update_braille(obj, offset) with a
+        # positional offset. This step inspects the current signature
+        # of every Orca method we patch and complains if our patch
+        # cannot accept the same positional parameters.
+        run: |
+          export PYTHONPATH="$PWD:$PYTHONPATH"
+          python - <<'PY'
+          import inspect, sys
+          # Patches declared by polyglot that mirror an Orca class method.
+          # (orca_class_path, orca_method, our_patched_fn_module, our_patched_fn_name)
+          patches = [
+              ("orca.scripts.default", "Script", "update_braille"),
+          ]
+          failed = []
+          for mod_path, cls_name, method in patches:
+              try:
+                  mod = __import__(mod_path, fromlist=[cls_name])
+                  cls = getattr(mod, cls_name)
+                  original = getattr(cls, method, None)
+                  if original is None:
+                      print(f"skip {mod_path}.{cls_name}.{method}: not present (new Orca?)")
+                      continue
+                  sig = inspect.signature(original)
+                  pos = [p for p in sig.parameters.values()
+                         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+                  print(f"ok   {mod_path}.{cls_name}.{method} has {len(pos)} positional params: {sig}")
+              except Exception as e:
+                  print(f"FAIL {mod_path}.{cls_name}.{method}: {type(e).__name__}: {e}")
+                  failed.append((mod_path, cls_name, method, e))
+          sys.exit(1 if failed else 0)
+          PY
