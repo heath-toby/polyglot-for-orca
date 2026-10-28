@@ -45,12 +45,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: system deps (accessibility typelibs + louis)
+      - name: system deps (accessibility + GTK typelibs + louis)
+        # The master Orca repo imports from a wide range of gi.repository
+        # namespaces during its own module-level initialisation; rather
+        # than chase them one at a time, pull the GTK3+GTK4 + accessibility
+        # stacks up front. All these packages are small and we are not
+        # running the GUI, so the cost is a few seconds of apt time.
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             python3-gi python3-louis \
-            gir1.2-atspi-2.0 gir1.2-atk-1.0 gir1.2-glib-2.0 \
+            gir1.2-glib-2.0 gir1.2-gobject-2.0 \
+            gir1.2-atspi-2.0 gir1.2-atk-1.0 \
+            gir1.2-gtk-3.0 gir1.2-gtk-4.0 \
+            gir1.2-gdk-3.0 gir1.2-gdkpixbuf-2.0 \
+            gir1.2-pango-1.0 gir1.2-cairo-1.0 \
             at-spi2-core libatspi2.0-dev
 
       - name: install Orca (master from git)
