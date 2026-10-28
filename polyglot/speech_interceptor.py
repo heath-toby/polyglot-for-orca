@@ -2351,13 +2351,22 @@ def _apply_patches():
 
         _original_update_braille = DefaultScript.update_braille
 
-        def _patched_update_braille(self, obj, **args):
+        def _patched_update_braille(self, obj, *positional, **args):
+            # Orca's terminal script overrides update_braille and calls
+            # super().update_braille(obj, offset) with offset POSITIONAL,
+            # not keyword — the old signature of (self, obj, **args) only
+            # accepted keyword args and raised TypeError on terminal
+            # typing. *positional captures any positional args and we
+            # forward them to the original transparently.
             _debug(f"update_braille: ENTER")
-            _apply_braille_language(obj, args.get("offset"), "update_braille")
+            offset = args.get("offset")
+            if offset is None and positional:
+                offset = positional[0]
+            _apply_braille_language(obj, offset, "update_braille")
 
             _debug("update_braille: calling original...")
             try:
-                result = _original_update_braille(self, obj, **args)
+                result = _original_update_braille(self, obj, *positional, **args)
                 _note_display_rendered()
                 _debug("update_braille: done")
                 return result
