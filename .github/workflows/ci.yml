@@ -56,10 +56,26 @@ jobs:
       - name: install Orca (master from git)
         run: |
           git clone --depth 1 https://gitlab.gnome.org/GNOME/orca.git /tmp/orca
-          # Orca's build system uses meson; for an import-only test it's
-          # enough to make the Python package importable from source.
-          # Also keep dist-packages on the path so transitive imports (e.g.
-          # louis, dasbus) resolve against the apt-installed stack.
+          # Orca uses meson, which generates a handful of files from .in
+          # templates at build time (orca_i18n, orca_platform, etc).
+          # Rather than running the full meson build in CI, drop minimal
+          # stubs that satisfy an import without needing meson at all.
+          # The import-check is static: we care that signatures and
+          # module structure line up, not that Orca actually runs.
+          cat > /tmp/orca/src/orca/orca_i18n.py <<'PY'
+          """CI stub for the meson-generated orca_i18n module."""
+          from gettext import gettext as _
+          def C_(ctx, s): return s
+          def ngettext(a, b, n): return a if n == 1 else b
+          PY
+          cat > /tmp/orca/src/orca/orca_platform.py <<'PY'
+          """CI stub for the meson-generated orca_platform module."""
+          version = "master"
+          revision = "ci-stub"
+          prefix = "/usr"
+          datadir = "/usr/share"
+          localedir = "/usr/share/locale"
+          PY
           echo "PYTHONPATH=/tmp/orca/src:/usr/lib/python3/dist-packages:$PYTHONPATH" >> "$GITHUB_ENV"
 
       - name: install Python runtime dependencies
