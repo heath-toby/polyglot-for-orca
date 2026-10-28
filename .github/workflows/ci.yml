@@ -83,7 +83,11 @@ jobs:
         # PYTHONPATH surfaces the system pip (installed via dpkg), which pip
         # refuses to uninstall. The runner's shipped pip is fine for a
         # single wheel install.
-        run: python -m pip install lingua-language-detector
+        #
+        # dasbus is Orca's own transitive dep for D-Bus; Polyglot imports
+        # it indirectly when it imports speech modules. lingua-language-
+        # detector is Polyglot's optional statistical detection backend.
+        run: python -m pip install lingua-language-detector dasbus
 
       - name: import polyglot (catches API-signature mismatches)
         # We can't fully "install" the extension without a running Orca
