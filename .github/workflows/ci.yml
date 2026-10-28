@@ -23,7 +23,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
       - name: install ruff
         run: python -m pip install --upgrade pip ruff
       - name: compile every .py (catches typos and broken syntax)
@@ -58,7 +57,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: system deps (Orca + accessibility stack)
         run: |
