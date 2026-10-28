@@ -5,6 +5,42 @@ All notable changes to Polyglot for Orca are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.4] — 2026-10-28
+
+### Fixed
+
+- **Typing in a terminal killed character echo, deletion feedback, typed-indent
+  beeps and braille-table switching.** On Orca master (v51+), the terminal
+  script `orca.scripts.terminal.script.Script` overrides `update_braille` with
+  signature `(self, obj, offset)` and calls `super().update_braille(obj, offset)`
+  — passing `offset` as a **positional** argument. The patched
+  `_patched_update_braille` was declared as `(self, obj, **args)` and so only
+  accepted keyword arguments. Every text-insert and text-delete event out of
+  VTE raised:
+
+  ```
+  TypeError: _patched_update_braille() takes 2 positional arguments but 3 were given
+  ```
+
+  The exception propagated up through `_on_text_deleted` / `_on_text_inserted`,
+  which the terminal path uses to drive character echo and deletion feedback —
+  so neither fired. Typed-indent beeps (via the Indent Beeper add-on, which
+  wraps the same handlers) stopped too. And because `_patched_update_braille`
+  never ran to completion, Polyglot's own `_apply_braille_language` call never
+  ran either, so the braille-table switch was silently broken in terminals
+  specifically — a non-English line in Wayterm would not flip tables.
+
+- Fix: the patch now accepts `(self, obj, *positional, **args)`. The call
+  reads `offset` from whichever source it arrives in (keyword or positional)
+  and forwards all parameters unchanged to the original. All three callers
+  work:
+
+  ```python
+  self.update_braille(obj)                  # positional obj only
+  self.update_braille(obj, offset=5)        # offset as keyword
+  super().update_braille(obj, offset)       # offset as positional (terminal)
+  ```
+
 ## [2.8.3] — 2026-10-09
 
 ### Fixed
