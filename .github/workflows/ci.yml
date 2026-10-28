@@ -67,16 +67,25 @@ jobs:
 
       - name: install Orca (stable from apt)
         if: matrix.source == 'apt'
-        run: sudo apt-get install -y --no-install-recommends orca
+        run: |
+          sudo apt-get install -y --no-install-recommends orca
+          # apt installs Orca's Python package to /usr/lib/python3/dist-packages,
+          # which the actions/setup-python runtime does not see by default.
+          # Hard-code the location rather than globbing: on Ubuntu LTS this
+          # path is stable and shared across Python minor versions. If it
+          # ever moves, the import step will fail with a clear error and
+          # we fix it here.
+          echo "PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH" >> "$GITHUB_ENV"
 
       - name: install Orca (master from git)
         if: matrix.source == 'git'
         run: |
           git clone --depth 1 https://gitlab.gnome.org/GNOME/orca.git /tmp/orca
-          cd /tmp/orca
           # Orca's build system uses meson; for an import-only test it's
           # enough to make the Python package importable from source.
-          echo "PYTHONPATH=/tmp/orca/src:$PYTHONPATH" >> "$GITHUB_ENV"
+          # Also keep dist-packages on the path so transitive imports (e.g.
+          # louis, dasbus) resolve against the apt-installed stack.
+          echo "PYTHONPATH=/tmp/orca/src:/usr/lib/python3/dist-packages:$PYTHONPATH" >> "$GITHUB_ENV"
 
       - name: install Python runtime dependencies
         run: python -m pip install --upgrade pip lingua-language-detector
