@@ -155,6 +155,22 @@ c.language_settings = {"de": {"contraction_table": DE_TABLE},
 si._rebuild_configured_languages()
 update_braille = DefaultScript.update_braille
 
+# Polyglot's per-caret-move braille hook mirrors Orca's own guard and returns
+# the original untouched when braille is not in use:
+#
+#     if not braille_presenter.get_presenter().use_braille():
+#         return _original_caret_braille(self, obj)
+#
+# That guard is right -- there is no reason to move braille tables when there
+# is no braille -- but it is False in this process, which has no display. The
+# caret rows below are about what Polyglot does *when braille is in use*, so
+# say that it is. Without this they ran the guard, returned early, recorded
+# nothing, and failed in a way that looked like the switching being broken.
+from orca import braille_presenter as _bp  # noqa: E402
+
+_bp.get_presenter().use_braille = lambda *_a, **_k: True
+
+
 class FakeScript:
     pass
 
@@ -711,6 +727,68 @@ check("hand-written runaway rule skipped, not run",
       ("number 5" in _out) and (_time.perf_counter() - _t0 < 1.0), True)
 import shutil as _shutil
 _shutil.rmtree(sd.DATA_DIR, ignore_errors=True)
+
+# --- the voice patch must accept everything upstream's does --------------
+# Upstream is voice(self, key=None, context=None, *, obj, string, language,
+# dialect), so `context` is its second *positional* parameter. The patch took
+# (self, key=None, **args), which works only because every Orca 51 caller
+# passes context by keyword or not at all; a positional one would raise
+# "takes from 1 to 2 positional arguments but 3 were given" and the voice
+# would be gone entirely, not just Polyglot's part of it. CapitalBeep was
+# broken by exactly this shape once, when spell_item grew (obj, start_offset).
+# Reported by the weekly maintenance agent, polyglot-for-orca#3.
+import inspect as _inspect
+from orca import speech_generator as _sg
+
+_patched = _sg.SpeechGenerator.voice
+_params = _inspect.signature(_patched).parameters
+check("the voice patch is installed", _patched.__name__, "_patched_voice")
+check("...and names context explicitly rather than swallowing it",
+      "context" in _params, True)
+check("...as its second positional parameter, where upstream has it",
+      list(_params)[:3], ["self", "key", "context"])
+
+
+# Bound against the real patched function, so a signature that cannot take a
+# positional context fails here rather than in Orca a release from now.
+_bind_ok = True
+try:
+    _inspect.signature(_patched).bind(
+        gen, "default", "a-context", obj=None, string="x",
+        language="en", dialect="")
+except TypeError:
+    _bind_ok = False
+check("a positional context binds, as a future Orca caller might pass it",
+      _bind_ok, True)
+
+_bind_kw_ok = True
+try:
+    _inspect.signature(_patched).bind(
+        gen, "default", obj=None, string="x", context="a-context",
+        language="en", dialect="")
+except TypeError:
+    _bind_kw_ok = False
+check("...and so does a keyword context, as Orca 51 passes it",
+      _bind_kw_ok, True)
+
+# And the call must actually survive being made that way. With detection off
+# the patch hands straight through to the original, which is the path a
+# positional context would break. What this cannot check is whether the
+# context is *dropped* rather than forwarded -- nothing observable comes back
+# either way, and the original is captured in a closure, out of reach. The
+# forwarding is one visible line; the rows above are the regression guard.
+_saved_mode = c.detection_mode
+c.detection_mode = "off"
+_called_ok = "raised nothing"
+try:
+    _result = _patched(gen, "default", ctx, obj=None, string="x",
+                       language="en", dialect="")
+    _called_ok = "raised nothing" if isinstance(_result, list) else f"odd: {_result!r}"
+except TypeError as _error:
+    _called_ok = f"TypeError: {_error}"
+check("calling it with a positional context reaches the original cleanly",
+      _called_ok, "raised nothing")
+c.detection_mode = _saved_mode
 
 w = max(len(r[0]) for r in rows)
 for name, want, got, status in rows:

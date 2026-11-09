@@ -1,5 +1,88 @@
 # Changelog
 
+## 2.9.0
+
+**Changing the braille table no longer stops Orca dead.** Reported by Toby:
+*"when Polyglot tries changing the braille code, it causes Orca to completely
+stop while it waits for that change to happen."*
+
+`brlapi.setParameter` is a synchronous round trip, and with BRLTTY running but
+no display attached it does not come back promptly. That state is ordinary now
+rather than exotic: `brltty.path` starts the service when a Bluetooth display
+appears and leaves it running after the display goes away. From Toby's own
+log, with Orca's main thread inside the call:
+
+```
+15:24:08 _set_brltty_text_table: en -> ru
+15:24:57 _set_brltty_text_table: ERROR Unexpected end of file
+```
+
+Forty-nine seconds of a wholly stopped screen reader -- no speech, no braille,
+no keys. A healthy call finishes inside the same second (`20:02:16 de -> en`,
+`20:02:16 done`), and one earlier line has no closing entry at all, so that
+call never returned. Toby had been working around it by stopping `brltty.path`
+whenever Bluetooth disconnected.
+
+There is nothing to wait for either: nothing here reads the reply. So the
+request goes to a worker thread and the caller returns at once -- measured
+against a deliberately slow fake, **0.3 ms instead of 1500 ms**. Toby: *"Just
+send the command through, and leave it there."*
+
+- A single daemon worker thread, so a call stuck inside brlapi cannot hold up
+  Orca's exit either.
+- A burst of language changes collapses to its last member. Setting the
+  intermediate tables would be extra round trips to arrive in the same place.
+- **The worker writes nothing the main thread reads.** `_apply_braille_language`
+  reads `_current_brltty_text_table` either side of a switch to decide whether
+  anything moved, and the flash restore compares it against a snapshot; a
+  worker clearing it on failure -- which the first cut of this did -- changes
+  those answers underneath the thread making them. The worker keeps its own
+  record and dedupes against that.
+- **A failure is retried rather than latched.** The old code set a
+  `_brltty_failed` flag on the first failure and never tried again, so a
+  session begun while BRLTTY was down never set a text table again *for the
+  rest of the session* -- including after a display was connected later,
+  which with `brltty.path` is the normal order of events. Connection failures
+  now back off for 30 seconds; a failed `setParameter` does not start that
+  backoff at all, because the connection was fine and the next attempt should
+  be free to reconnect at once.
+- `uninstall()` had the same hang on the main thread, since disabling Polyglot
+  restores the default tables. It queues the restore, sends a stop and waits a
+  quarter of a second at most. The worker honours a stop *after* the last
+  table, so the restore still gets through.
+
+18 new rows in `tests-brltty-worker.py`, which stands a fake `brlapi` with a
+sleeping `setParameter` in front of the real one -- so the hang is reproducible
+with no BRLTTY and no display.
+
+### The voice patch now takes upstream's positional `context`
+
+Reported by the weekly maintenance agent, #3, and left open for a week.
+Upstream is `voice(self, key=None, context=None, *, obj, string, language,
+dialect)`, so `context` is its second **positional** parameter. The patch took
+`(self, key=None, **args)`, which works only because every Orca 51 caller
+passes `context` by keyword or not at all. A positional one would raise
+`TypeError: takes from 1 to 2 positional arguments but 3 were given`, and the
+voice would be gone entirely -- not just Polyglot's part of it. CapitalBeep was
+broken by exactly this shape once, when `spell_item` grew
+`(obj, start_offset)`. `context` is named explicitly now and forwarded.
+
+### The test suite had ten red rows, and they were the harness
+
+`tests-language-matrix.py` was 87/97 before any of this. Every one of the ten
+was downstream of the caret hook's first guard:
+
+```python
+if not braille_presenter.get_presenter().use_braille():
+    return _original_caret_braille(self, obj)
+```
+
+That guard is correct -- there is no reason to move braille tables when there
+is no braille -- but it is False in a test process with no display, so the hook
+returned Orca's original, recorded nothing, and ten rows failed in a way that
+looked like the switching being broken. The suite had not exercised the caret
+path since the guard was added. It stubs `use_braille` now, and is 103/103.
+
 All notable changes to Polyglot for Orca are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

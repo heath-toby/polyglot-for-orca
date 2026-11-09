@@ -6,7 +6,10 @@ language switching, emoji/emoticon expansion, and Unicode announcement.
 
 import logging
 import os
+import queue
 import sys
+import threading
+import time
 
 log = logging.getLogger("polyglot")
 
@@ -1061,8 +1064,49 @@ def _set_orca_names_locale(lang_code):
 
 
 _current_contraction_table = None
-_brltty_conn = None
-_brltty_failed = False
+# --- BRLTTY's text table, set without ever making Orca wait --------------
+#
+# brlapi's setParameter is a synchronous round trip, and with BRLTTY running
+# but no display attached it does not come back promptly. That state is
+# ordinary now rather than exotic: `brltty.path` starts the service when the
+# Bluetooth display appears and leaves it running after the display goes
+# away. Measured from Toby's own log -- 49 seconds inside one call, with
+# Orca's main thread in it, before brlapi gave up:
+#
+#     15:24:08 _set_brltty_text_table: en -> ru
+#     15:24:57 _set_brltty_text_table: ERROR Unexpected end of file
+#
+# A healthy call finishes inside the same second (20:02:16 -> 20:02:16), and
+# one earlier line has no closing entry at all, so that call never returned.
+# Orca is wholly stopped for the duration: speech, braille, keys.
+#
+# There is nothing to wait for anyway. Nothing in Polyglot reads the reply --
+# the table is set or it is not -- so the request goes to a worker thread and
+# the caller returns at once. Toby: *"Just send the command through, and
+# leave it there."*
+_brltty_queue: "queue.Queue | None" = None
+_brltty_thread: "threading.Thread | None" = None
+_brltty_start_lock = threading.Lock()
+_BRLTTY_STOP = object()
+
+# How long to leave BRLTTY alone after a failed connection attempt. The old
+# code latched a `_brltty_failed` flag on the first failure and never tried
+# again, which meant a session started while BRLTTY was down never set a text
+# table again -- including after a display was connected later, which with
+# `brltty.path` is the normal way round. Backing off and retrying is right;
+# giving up for the session is not.
+_BRLTTY_RETRY_SECONDS = 30.0
+
+# The table last *requested*, not last confirmed. Nothing reads the reply, so
+# there is nothing to confirm; and recording it on completion would re-request
+# the same table on every language change while a call was outstanding.
+#
+# **Main thread only.** The worker must never write it, because
+# `_apply_braille_language` reads it either side of a switch to decide whether
+# anything moved, and the flash restore compares it against a snapshot. A
+# worker clearing it on failure -- which is what the first version of this did
+# -- changes those answers underneath the thread making them. The worker keeps
+# its own record of what it has set and dedupes against that instead.
 _current_brltty_text_table = None
 
 # Saved state captured when entering a flash message (notifications,
@@ -1730,40 +1774,161 @@ def _set_contraction_table(table_path):
 
 
 def _set_brltty_text_table(lang_code):
-    """Set BrlTTY's computer braille (text) table to match the language."""
-    global _brltty_conn, _brltty_failed, _current_brltty_text_table
+    """Ask BRLTTY for a computer braille table. Returns immediately.
+
+    The work happens on a worker thread; see the comment above
+    ``_brltty_queue`` for why this must never be done on the calling thread.
+    """
+    global _current_brltty_text_table
 
     if lang_code == _current_brltty_text_table:
         return
 
-    if _brltty_failed:
+    worker_queue = _ensure_brltty_worker()
+    if worker_queue is None:
         return
+    _current_brltty_text_table = lang_code
+    _debug(f"_set_brltty_text_table: queued {lang_code}")
+    worker_queue.put(lang_code)
 
-    try:
-        import brlapi
 
-        if _brltty_conn is None:
+def _ensure_brltty_worker():
+    """The worker's queue, starting the thread on first use.
+
+    A daemon thread, deliberately: a call stuck inside brlapi must not be
+    able to hold up Orca's exit, and there is nothing in a half-finished
+    table change worth waiting for.
+    """
+    global _brltty_queue, _brltty_thread
+
+    with _brltty_start_lock:
+        if _brltty_thread is not None and _brltty_thread.is_alive():
+            return _brltty_queue
+        try:
+            _brltty_queue = queue.Queue()
+            _brltty_thread = threading.Thread(
+                target=_brltty_worker,
+                args=(_brltty_queue,),
+                name="polyglot-brltty",
+                daemon=True,
+            )
+            _brltty_thread.start()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            _debug(f"_set_brltty_text_table: no worker thread: {error}")
+            _brltty_queue = None
+            _brltty_thread = None
+            return None
+        return _brltty_queue
+
+
+def _brltty_next_request(worker_queue, first):
+    """The newest queued table, and whether a stop was seen.
+
+    Only the latest table matters: if three language changes queued up while
+    one call was in flight, setting the first two would be two more
+    round trips to arrive at the same place. A stop is honoured *after* the
+    last table, so the restore-to-default that ``uninstall`` queues still
+    gets through.
+    """
+    stop = first is _BRLTTY_STOP
+    latest = None if stop else first
+    while True:
+        try:
+            item = worker_queue.get_nowait()
+        except queue.Empty:
+            return latest, stop
+        if item is _BRLTTY_STOP:
+            stop = True
+        else:
+            latest = item
+
+
+def _brltty_worker(worker_queue):
+    """Own the brlapi connection and do the waiting, off the main thread.
+
+    Keeps its own record of what it has set, and writes no module state that
+    the main thread reads. ``last_set`` is cleared whenever a call fails, so
+    the same table can be asked for again once BRLTTY is back -- what is not
+    retried is a language returning to the one whose set failed, because the
+    caller dedupes that away. The change after it puts things right, and the
+    alternative is a worker thread editing the bookkeeping that
+    ``_apply_braille_language`` is in the middle of reading.
+    """
+    conn = None
+    last_failure = 0.0
+    last_set = None
+
+    def drop(reason):
+        nonlocal conn
+        if conn is not None:
             try:
-                _brltty_conn = brlapi.Connection()
-            except Exception:
-                _brltty_conn = None
-                _brltty_failed = True
-                return
+                conn.closeConnection()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        conn = None
+        _debug(f"brltty worker: dropped the connection ({reason})")
 
-        _debug(f"_set_brltty_text_table: {_current_brltty_text_table} -> {lang_code}")
-        _brltty_conn.setParameter(
-            brlapi.PARAM_COMPUTER_BRAILLE_TABLE,
-            0,
-            brlapi.PARAMF_GLOBAL,
-            lang_code,
-        )
-        _current_brltty_text_table = lang_code
-        _debug(f"_set_brltty_text_table: done")
-    except ImportError:
-        _brltty_failed = True
-    except Exception as e:
-        _debug(f"_set_brltty_text_table: ERROR {e}")
-        _brltty_conn = None
+    while True:
+        try:
+            item = worker_queue.get()
+        except Exception:  # pylint: disable=broad-exception-caught
+            return
+        lang_code, stop = _brltty_next_request(worker_queue, item)
+
+        if lang_code is not None:
+            try:
+                import brlapi
+            except ImportError:
+                _debug("brltty worker: no brlapi module; nothing to set")
+                if stop:
+                    return
+                continue
+
+            now = time.time()
+            if lang_code == last_set:
+                _debug(f"brltty worker: {lang_code} is already set")
+            elif conn is None and now - last_failure < _BRLTTY_RETRY_SECONDS:
+                _debug("brltty worker: still backing off from a failed connect")
+            else:
+                if conn is None:
+                    try:
+                        conn = brlapi.Connection()
+                    except Exception as error:  # pylint: disable=broad-exception-caught
+                        conn = None
+                        last_failure = now
+                        _debug(f"brltty worker: cannot connect: {error}")
+                if conn is not None:
+                    started = time.time()
+                    try:
+                        conn.setParameter(
+                            brlapi.PARAM_COMPUTER_BRAILLE_TABLE,
+                            0,
+                            brlapi.PARAMF_GLOBAL,
+                            lang_code,
+                        )
+                        last_set = lang_code
+                        _debug(f"brltty worker: set {lang_code} in "
+                               f"{(time.time() - started) * 1000:.0f}ms")
+                    except Exception as error:  # pylint: disable=broad-exception-caught
+                        # Forget what we thought was set, so the next request
+                        # is attempted rather than deduped away against a
+                        # value that never took.
+                        #
+                        # Deliberately *not* starting the connect backoff: the
+                        # connection was fine, the call was not, and the next
+                        # attempt should be free to reconnect at once. If
+                        # BRLTTY really has gone, the reconnect fails and that
+                        # is what starts the backoff. Setting it here instead
+                        # meant a display coming back had to wait out 30
+                        # seconds for no reason.
+                        last_set = None
+                        _debug(f"brltty worker: setting {lang_code} failed after "
+                               f"{(time.time() - started) * 1000:.0f}ms: {error}")
+                        drop("set failed")
+
+        if stop:
+            drop("stopping")
+            return
 
 
 # Orca's stand-in for "whatever the synthesiser defaults to". It is not a
@@ -2184,7 +2349,22 @@ def _apply_patches():
         from orca import speech_generator as sg
         _original_voice = sg.SpeechGenerator.voice
 
-        def _patched_voice(self, key=None, **args):
+        # `context` is named explicitly rather than left to **args, and
+        # forwarded on. Upstream's signature is
+        #
+        #     voice(self, key=None, context=None, *, obj, string, language,
+        #           dialect)
+        #
+        # so context is its second *positional* parameter. Every caller in
+        # Orca 51 passes it by keyword or not at all, which is why **args
+        # worked -- but a caller passing it positionally would hit
+        # "takes from 1 to 2 positional arguments but 3 were given" and the
+        # voice would be gone, not just Polyglot's part of it. The same shape
+        # of mistake broke CapitalBeep against a newer Orca once already,
+        # when spell_item grew (obj, start_offset).
+        #
+        # Reported by the weekly maintenance agent, heath-toby/polyglot-for-orca#3.
+        def _patched_voice(self, key=None, context=None, **args):
             try:
                 mode = _config.detection_mode if _config else "markup_text"
                 if (_config.enabled and _detector and not _is_app_ignored()
@@ -2296,7 +2476,7 @@ def _apply_patches():
                 _debug(f"voice pre: ERROR {e}")
 
             try:
-                return _original_voice(self, key, **args)
+                return _original_voice(self, key, context, **args)
             except Exception as e:
                 _debug(f"voice ORIGINAL CRASHED: {type(e).__name__}: {e}")
                 import traceback
@@ -2626,7 +2806,7 @@ def _restore_orca_state():
     explain it. The brlapi connection is closed for the same reason -- a
     disabled extension should not be holding one open.
     """
-    global _brltty_conn
+    global _brltty_queue, _brltty_thread
 
     if _current_names_locale is not None:
         try:
@@ -2646,12 +2826,24 @@ def _restore_orca_state():
         except Exception as error:  # pylint: disable=broad-exception-caught
             log.debug(f"Polyglot: could not restore the braille tables: {error}")
 
-    if _brltty_conn is not None:
+    # Stop the BRLTTY worker, and do not wait for it to finish. It owns the
+    # brlapi connection and closes it on the way out; if it is stuck inside a
+    # call -- which is the whole reason it exists -- joining would put the
+    # 49-second wait back, here in Orca's teardown. It is a daemon thread, so
+    # leaving it is safe. The restore-to-default queued just above is still
+    # applied first: the worker honours a stop after the last table.
+    worker, thread = _brltty_queue, _brltty_thread
+    _brltty_queue = None
+    _brltty_thread = None
+    if worker is not None:
         try:
-            _brltty_conn.closeConnection()
+            worker.put(_BRLTTY_STOP)
         except Exception:  # pylint: disable=broad-exception-caught
             pass
-        _brltty_conn = None
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=0.25)
+        if thread.is_alive():
+            log.debug("Polyglot: the BRLTTY worker is still busy; leaving it")
 
 
 def open_settings():
