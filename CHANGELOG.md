@@ -85,6 +85,32 @@ failure, and the worker is what makes carrying on safe.
 sleeping `setParameter` in front of the real one -- so the hang is reproducible
 with no BRLTTY and no display.
 
+### The debug log gets dates, a size cap, and a quieter hot path
+
+The log had reached **108 MB** and does not rotate. Worse than the size: every
+line carried the **time only**, and the file spans days -- so a 108 MB log held
+several lines stamped `19:37:47` with nothing to distinguish them. Reading a
+time window out of it silently matches the wrong day, which cost an analysis
+during this very investigation: a window anchored on `19:37:47` returned
+old-format lines from a previous day and looked exactly like proof that a
+newly installed build was not running. A timestamp without a date, in an
+append-only log that spans days, is not a timestamp but a trap.
+
+- Every line is now stamped `%Y-%m-%d %H:%M:%S`, and each session opens with a
+  dated banner naming the size cap.
+- The log rolls at 2 MB, keeping one previous copy as `debug.log.1`.
+- `kill_flash` is one of the hottest paths in the add-on -- Orca kills a flash
+  on essentially every presentation -- and it logged two lines every time, the
+  kill and a full display dump. That was **107 of the last 400 lines**, all
+  identical. It now logs only when the restore actually moved a table, which
+  is the case anyone would want to read.
+
+Note for anyone turning it off: the log is still gated on
+`ORCA_POLYGLOT_DEBUG`, read once at import, so switching it off means editing
+whatever sets that variable (here, a systemd user drop-in at
+`~/.config/systemd/user/orca.service.d/polyglot-debug.conf`) and restarting
+Orca. Polyglot has no in-dialog toggle for it yet.
+
 ### The voice patch now takes upstream's positional `context`
 
 Reported by the weekly maintenance agent, #3, and left open for a week.

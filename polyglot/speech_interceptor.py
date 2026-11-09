@@ -56,24 +56,72 @@ def _unpatch_all():
             log.warning(f"Polyglot: could not restore {attr}: {error}")
 
 
-# File-based debug log for diagnosing issues
+# File-based debug log for diagnosing issues.
 _debug_log = None
 _DEBUG_ENABLED = os.environ.get("ORCA_POLYGLOT_DEBUG", "").lower() in ("1", "true", "yes")
 
+# **Every line carries the date.** It used to carry the time only, and the log
+# does not rotate daily, so a 108MB file held several days of lines stamped
+# 19:37:47 with nothing to tell them apart. Any attempt to read a time window
+# out of it silently matches the wrong day: that cost an analysis during this
+# very investigation, which concluded from old lines that a newly installed
+# build was not running. A timestamp without a date in an append-only log is
+# not a timestamp, it is a trap.
+_LOG_STAMP = "%Y-%m-%d %H:%M:%S"
+
+# Diagnostics get left on -- this log reached 108MB. One rollover is kept, so
+# the previous run is still there to compare against.
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _debug_path():
+    return os.path.join(_DATA_DIR, "debug.log")
+
+
+def _roll_log_if_large():
+    """Keep one old log and start a new one, if the current one is big."""
+    global _debug_log
+    path = _debug_path()
+    try:
+        if os.path.getsize(path) < _LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        if _debug_log is not None:
+            _debug_log.close()
+    except OSError:
+        pass
+    _debug_log = None
+    try:
+        os.replace(path, path + ".1")
+    except OSError:
+        pass
+
 
 def _debug(msg):
-    """Write debug message to file log if ORCA_POLYGLOT_DEBUG is set."""
+    """Write a debug line, if diagnostics are on.
+
+    Gated on ORCA_POLYGLOT_DEBUG, which is read once at import -- so turning
+    it off means editing
+    ~/.config/systemd/user/orca.service.d/polyglot-debug.conf (or whatever
+    sets it), reloading the unit and restarting Orca.
+    """
     global _debug_log
     if not _DEBUG_ENABLED:
         return
     try:
         if _debug_log is None:
             os.makedirs(_DATA_DIR, exist_ok=True)
-            log_path = os.path.join(_DATA_DIR, "debug.log")
-            _debug_log = open(log_path, "a")
-        import time
-        _debug_log.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+            _roll_log_if_large()
+            _debug_log = open(_debug_path(), "a")
+            _debug_log.write(
+                f"{time.strftime(_LOG_STAMP)} --- Polyglot log opened "
+                f"(rolls at {_LOG_MAX_BYTES:,} bytes) ---\n")
+        _debug_log.write(f"{time.strftime(_LOG_STAMP)} {msg}\n")
         _debug_log.flush()
+        if _debug_log.tell() >= _LOG_MAX_BYTES:
+            _roll_log_if_large()
     except Exception:
         pass
 
@@ -2794,12 +2842,24 @@ def _apply_patches():
             # about to update braille (detection_mode=off, empty text,
             # short-circuit paths), restoring is the right default
             # rather than letting the flash's tables stick.
+            # Orca kills a flash on essentially every presentation, so this
+            # is one of the hottest paths in the add-on. It used to log two
+            # lines every time -- the kill and a full display dump -- which
+            # was 107 of the last 400 lines in a 108MB log, all identical.
+            # Volume like that does not just cost disk, it buries the next
+            # diagnosis. Log it only when the restore actually moved a table,
+            # which is the case anyone would ever want to read.
+            before = (_current_contraction_table, _current_brltty_text_table)
             try:
                 if _config and _config.enabled:
-                    _debug(f"flash: killed, restore_saved={restore_saved}")
                     _restore_pre_flash_state()
             except Exception as e:
                 _debug(f"kill_flash pre: ERROR {e}")
+            restored = (_current_contraction_table, _current_brltty_text_table) != before
+            if restored:
+                _debug(f"flash: killed, restore_saved={restore_saved}, "
+                       f"tables restored to {before} -> "
+                       f"{(_current_contraction_table, _current_brltty_text_table)}")
             try:
                 return _original_kill_flash(restore_saved)
             finally:
@@ -2809,7 +2869,8 @@ def _apply_patches():
                 # what the cells were translated under.
                 if restore_saved:
                     _note_display_rendered()
-                _describe_display(f"after kill_flash({restore_saved})")
+                if restored:
+                    _describe_display(f"after kill_flash({restore_saved})")
 
         _patch(braille, "display_message", _patched_display_message)
         _patch(braille, "_flash_callback", _patched_flash_callback)
