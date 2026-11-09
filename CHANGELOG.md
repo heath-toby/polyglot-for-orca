@@ -51,7 +51,37 @@ send the command through, and leave it there."*
   quarter of a second at most. The worker honours a stop *after* the last
   table, so the restore still gets through.
 
-18 new rows in `tests-brltty-worker.py`, which stands a fake `brlapi` with a
+### And it does not ask at all when there is no display
+
+Toby, after the above: *"Is there no way where we can actually find out
+whether Orca successfully connected to the braille display... Preferably, we
+needn't pole anything."* There is, and it needs neither a poll nor a
+subscription.
+
+`braille.has_braille_device()` is a **local read of Orca's own
+`brlapi_ready`** -- no round trip to BRLTTY, nothing to wait for. Orca
+maintains it properly: `_mark_brlapi_dead` clears it and schedules a
+reconnect, the backoff doubles from 2s to a 60s cap, and it is set again once
+a display reports a size. A computer braille table is a property of something
+being displayed, so with no display Polyglot now records what the language
+wants and sends nothing. That skips the 49-second call rather than surviving
+it.
+
+The display **coming back** is caught with no timer and no callback: the next
+language change sees a display present where there was none and re-applies the
+table that was skipped. Polyglot's hooks run on caret moves and focus changes,
+so in practice that is within a keystroke. Once, not repeatedly.
+
+The worker stays, and is not redundant. Orca's flag can only go false *after*
+a failure, so there is always a window in which the display has gone and
+nothing knows yet -- which is the window Toby was living in. The gate makes the
+call unnecessary; the worker makes it survivable.
+
+If `has_braille_device` ever stops existing, the gate treats that as "display
+present" and carries on as before. Going quietly silent would be the worse
+failure, and the worker is what makes carrying on safe.
+
+23 rows in `tests-brltty-worker.py`, which stands a fake `brlapi` with a
 sleeping `setParameter` in front of the real one -- so the hang is reproducible
 with no BRLTTY and no display.
 

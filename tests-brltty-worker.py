@@ -85,6 +85,11 @@ from polyglot import speech_interceptor as si  # noqa: E402
 
 si._debug = lambda *_args, **_kwargs: None
 
+# Most rows below are about what happens when there *is* a display, so say so.
+# The display-absent rows set this themselves.
+_display = [True]
+si._braille_display_present = lambda: _display[0]
+
 
 def reset(delay=HANG_SECONDS, connect_error=None, set_error=None):
     """A fresh worker and a fresh fake, between rows."""
@@ -101,6 +106,8 @@ def reset(delay=HANG_SECONDS, connect_error=None, set_error=None):
     FakeConnection.delay = delay
     FakeConnection.connect_error = connect_error
     FakeConnection.set_error = set_error
+    _display[0] = True
+    si._brltty_display_seen = True
 
 
 def settle(seconds=HANG_SECONDS * 3):
@@ -202,6 +209,57 @@ si._set_brltty_text_table("en")
 time.sleep(0.4)
 check("a machine with no brlapi is silently fine", FakeConnection.calls, [])
 sys.modules["brlapi"] = saved
+
+# --- no display, no request ----------------------------------------------
+# A computer braille table is a property of something being displayed. With no
+# display there is nothing to set it for, and asking is the very call that took
+# 49 seconds. Orca already knows, in braille.has_braille_device(), which is a
+# local read of its own brlapi_ready -- so this costs nothing and polls
+# nothing.
+reset(delay=0.0)
+_display[0] = False
+si._brltty_display_seen = False
+si._set_brltty_text_table("ru")
+time.sleep(0.3)
+check("with no display, BRLTTY is not asked at all", FakeConnection.calls, [])
+check("...but the language's table is remembered",
+      si._current_brltty_text_table, "ru")
+
+# --- the display coming back is caught without polling -------------------
+# No timer and no subscription: the next language change notices that a
+# display is present when it was not, and re-applies the table that was
+# skipped. In practice that is within a keystroke, because Polyglot's hooks
+# run on caret moves and focus changes.
+_display[0] = True
+si._set_brltty_text_table("ru")
+settle(1.0)
+check("a display coming back re-applies the table that was skipped",
+      FakeConnection.calls, ["ru"])
+
+# And it must not re-apply for ever after -- once is the point.
+FakeConnection.calls = []
+si._set_brltty_text_table("ru")
+time.sleep(0.3)
+check("...once, not on every change after that", FakeConnection.calls, [])
+
+# --- a missing Orca API must not silence us ------------------------------
+# If has_braille_device ever stops existing, the right failure is to carry on
+# as before -- the worker makes that safe -- not to go quietly silent.
+reset(delay=0.0)
+_saved_present = si._braille_display_present
+si._braille_display_present = _saved_present
+_probe_result = None
+try:
+    from orca import braille as _braille
+    _saved_getter = getattr(_braille, "has_braille_device", None)
+    del _braille.has_braille_device
+    _probe_result = si._braille_display_present()
+finally:
+    if _saved_getter is not None:
+        _braille.has_braille_device = _saved_getter
+check("a missing has_braille_device is treated as 'display present'",
+      _probe_result, True)
+si._braille_display_present = lambda: _display[0]
 
 # --- the stop honours the table queued before it -------------------------
 # uninstall() asks for the default tables and then stops the worker. The

@@ -1097,6 +1097,13 @@ _BRLTTY_STOP = object()
 # giving up for the session is not.
 _BRLTTY_RETRY_SECONDS = 30.0
 
+# Whether a display was there the last time we looked. Orca tracks the real
+# answer for us -- see `_braille_display_present` -- and this remembers the
+# previous one so that a display coming back can be spotted without polling
+# anything: the next language change sees "absent then present" and re-applies
+# the table that was skipped while it was away.
+_brltty_display_seen = False
+
 # The table last *requested*, not last confirmed. Nothing reads the reply, so
 # there is nothing to confirm; and recording it on completion would re-request
 # the same table on every language change while a call was outstanding.
@@ -1773,22 +1780,69 @@ def _set_contraction_table(table_path):
     _set_brltty_text_table(lang_code)
 
 
+def _braille_display_present():
+    """True if Orca has a braille display connected and reporting a size.
+
+    ``braille.has_braille_device()`` is a local read of Orca's own
+    ``brlapi_ready`` -- no round trip, nothing to poll. Orca maintains it
+    properly: it reconnects after a failure with a backoff doubling from 2s to
+    a 60s cap (``_schedule_brlapi_retry``), clears the flag through
+    ``_mark_brlapi_dead``, and sets it again once a display reports a size.
+
+    Unknown counts as present. If this ever stops existing, the right failure
+    is to carry on sending table changes as before -- the worker makes that
+    safe -- rather than to go quietly silent.
+    """
+    try:
+        from orca import braille
+        getter = getattr(braille, "has_braille_device", None)
+        if getter is None:
+            return True
+        return bool(getter())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return True
+
+
 def _set_brltty_text_table(lang_code):
     """Ask BRLTTY for a computer braille table. Returns immediately.
 
-    The work happens on a worker thread; see the comment above
-    ``_brltty_queue`` for why this must never be done on the calling thread.
-    """
-    global _current_brltty_text_table
+    Two things stand between a language change and a blocked screen reader.
 
-    if lang_code == _current_brltty_text_table:
+    **Do not ask at all when there is no display.** A table is a property of
+    something being displayed; with no display there is nothing to set it for,
+    and asking is exactly the call that took 49 seconds. Orca already knows
+    the answer, so this costs a local attribute read.
+
+    **And when there is, ask on a worker thread anyway.** Orca's flag can only
+    go false *after* a failure, so there is always a window where the display
+    has gone and nothing knows yet. That window is the one Toby was living in,
+    and the worker is what makes it survivable rather than merely unlikely.
+    """
+    global _current_brltty_text_table, _brltty_display_seen
+
+    present = _braille_display_present()
+    reconnected = present and not _brltty_display_seen
+    _brltty_display_seen = present
+
+    if not present:
+        # Remember what the language wants, so the display coming back can be
+        # caught up. Nothing is sent: there is nothing to send it to.
+        if lang_code != _current_brltty_text_table:
+            _debug(f"_set_brltty_text_table: no display; remembering {lang_code}")
+        _current_brltty_text_table = lang_code
+        return
+
+    if lang_code == _current_brltty_text_table and not reconnected:
         return
 
     worker_queue = _ensure_brltty_worker()
     if worker_queue is None:
         return
     _current_brltty_text_table = lang_code
-    _debug(f"_set_brltty_text_table: queued {lang_code}")
+    if reconnected:
+        _debug(f"_set_brltty_text_table: display is back; re-applying {lang_code}")
+    else:
+        _debug(f"_set_brltty_text_table: queued {lang_code}")
     worker_queue.put(lang_code)
 
 
