@@ -2612,6 +2612,36 @@ def _apply_patches():
                     text = _apply_dictionary(text, _current_language)
             except Exception as e:
                 _debug(f"adjust_for_presentation dictionary: ERROR {e}")
+            # Emoticons are expanded here, and this is the only place that
+            # works for a line being read. `_patched_speak` also does it, but
+            # only on its string branch -- and `SpeechPresenter._speak` takes
+            # "a string or a list from the speech generator", with `speak_line`
+            # passing the list. So the `isinstance(text, str)` guard there is
+            # False for every line read, and Toby heard nothing: *"I don't hear
+            # smiley for :), frown for :(, or any other ones."*
+            #
+            # Emoji and Unicode names were unaffected because they are caught
+            # by `_expand_unpronounceable` below, which runs on each utterance
+            # as a plain string. An emoticon is pure ASCII, every character of
+            # it "pronounceable", so that pass leaves it alone -- it was the
+            # one transformation with no second home.
+            #
+            # **Before the Unicode pass, not after.** That pass renames any
+            # character it does not consider speakable, which takes the
+            # emoticon apart before it can be matched: "shrug ¯\_(ツ)_/¯"
+            # becomes "shrug macron \_(ツ)_/ macron". After the dictionary,
+            # for the reason given above: a rule should get the chance to match
+            # the characters rather than the name they are about to be given.
+            #
+            # The calls in `_patched_speak` are left in place. Running twice is
+            # a no-op -- the first pass leaves no emoticon for the second --
+            # and they still cover anything that reaches speech without coming
+            # through here.
+            try:
+                if _config.speak_emoticons and text and isinstance(text, str):
+                    text = _expand_emoticons(text)
+            except Exception as e:
+                _debug(f"adjust_for_presentation emoticons: ERROR {e}")
             try:
                 verbosity = _config.unicode_verbosity
                 if verbosity != "off" and text and isinstance(text, str):

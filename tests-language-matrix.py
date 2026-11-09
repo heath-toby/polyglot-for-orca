@@ -728,6 +728,47 @@ check("hand-written runaway rule skipped, not run",
 import shutil as _shutil
 _shutil.rmtree(sd.DATA_DIR, ignore_errors=True)
 
+# --- emoticons must survive the path a read line actually takes ----------
+# They were only expanded in _patched_speak's string branch, and
+# SpeechPresenter._speak takes "a string or a list from the speech generator"
+# -- speak_line passes the list. So the isinstance(text, str) guard was False
+# for every line read and Toby heard nothing: "I don't hear smiley for :),
+# frown for :(, or any other ones." Emoji and Unicode names were fine because
+# _expand_unpronounceable catches them; an emoticon is pure ASCII, so that
+# pass leaves it alone and it had no second home.
+#
+# These rows drive the real patched adjust_for_presentation, which is the
+# funnel every utterance passes through as a plain string.
+_adjust = p.adjust_for_presentation
+check("adjust_for_presentation is Polyglot's", 
+      "_patched_adjust" in getattr(_adjust, "__qualname__", "") or
+      "_patched_adjust" in getattr(_adjust, "__name__", ""), True)
+
+_saved_emoticons = c.speak_emoticons
+c.speak_emoticons = True
+check("a smiley is announced when a line is read",
+      "smiley face" in _adjust(None, "hello :)"), True)
+check("a sad face is announced", "sad face" in _adjust(None, "oh no :("), True)
+check("a winking face is announced", "winking face" in _adjust(None, "sure ;)"), True)
+check("an emoticon mid-sentence is announced",
+      "grinning face" in _adjust(None, "well :D indeed"), True)
+
+# Ordering: the Unicode pass renames any character it thinks unspeakable, which
+# takes a non-ASCII emoticon apart -- "¯" becomes "macron" -- so emoticons have
+# to be expanded before it, not after.
+check("a non-ASCII emoticon survives the Unicode pass",
+      "shrug" in _adjust(None, "whatever \u00af\\_(\u30c4)_/\u00af"), True)
+
+# A colon that is not an emoticon must be left alone.
+check("a bare colon is not an emoticon",
+      "smiley" not in _adjust(None, "Note: this is fine"), True)
+check("a time is not an emoticon", "smiley" not in _adjust(None, "at 10:00"), True)
+
+c.speak_emoticons = False
+check("and the setting is honoured when off",
+      "smiley" not in _adjust(None, "hello :)"), True)
+c.speak_emoticons = _saved_emoticons
+
 # --- the voice patch must accept everything upstream's does --------------
 # Upstream is voice(self, key=None, context=None, *, obj, string, language,
 # dialect), so `context` is its second *positional* parameter. The patch took

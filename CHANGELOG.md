@@ -1,5 +1,48 @@
 # Changelog
 
+## 2.9.1
+
+**Emoticons were never announced when reading a line.** Reported by Toby:
+*"Polyglot emoticon reporting is inop. I don't hear smiley for :), frown for
+:(, or any other ones that may be in a dictionary."*
+
+The table and the matcher were both fine -- `_expand_emoticons("hello :)")`
+returns `"hello smiley face"` -- and the setting was on. The fault was where it
+was called from. `SpeechPresenter._speak` takes, in Orca's own words, "a string
+or a list from the speech generator", and `speak_line` passes **the list**:
+
+```python
+utterances = generator.generate_line(obj, start_offset, end_offset, line, context)
+self._speak(utterances, obj=obj)
+```
+
+Both expansions in `_patched_speak` are guarded by
+`isinstance(text, str)`, which is therefore False for every line read. Nothing
+raised, nothing logged; the text simply went by.
+
+Emoji and Unicode names were unaffected, which is why this looked like an
+emoticon-specific bug: they are caught by `_expand_unpronounceable`, which
+runs inside `adjust_for_presentation` on each utterance as a plain string. An
+emoticon is pure ASCII and every character of it counts as "pronounceable", so
+that pass leaves it alone -- it was the one transformation with no second home.
+
+Emoticons are now expanded in `adjust_for_presentation` alongside the speech
+dictionary and the Unicode pass, **before** the Unicode pass rather than after.
+That ordering is load-bearing: the Unicode pass renames any character it does
+not consider speakable, which takes a non-ASCII emoticon apart before it can be
+matched -- `shrug ¯\_(ツ)_/¯` becomes `shrug macron \_(ツ)_/ macron`. It runs
+after the dictionary, for the reason already recorded there: a rule should get
+the chance to match the characters rather than the name they are about to be
+given.
+
+The calls in `_patched_speak` are left in place. Running twice is a no-op, and
+they still cover anything reaching speech without coming through the funnel.
+
+Nine new rows driving the real patched `adjust_for_presentation`: each
+emoticon announced, one mid-sentence, the non-ASCII one surviving the Unicode
+pass, a bare colon and a clock time left alone, and the setting honoured when
+off. 112 rows in the matrix suite.
+
 ## 2.9.0
 
 **Changing the braille table no longer stops Orca dead.** Reported by Toby:
