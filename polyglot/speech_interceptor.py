@@ -226,37 +226,51 @@ def _expand_emoji_char(char, lang_code=None):
 
 
 
-# Text emoticon pronunciations
+# Text emoticon pronunciations, as (brief, verbose).
+#
+# Brief is what macOS VoiceOver says and what Toby is used to -- "smiley",
+# "frown", "wink" -- and it is the one salient word rather than a description:
+# *"I don't think I've ever seen smiley face. I'm more used to just smiley,
+# frown, wink, which is what MacOS VoiceOver would say, and it's a bit more
+# brief, per the brief mode Polyglot has."*
+#
+# Which one is used follows the existing **Unicode character names** setting,
+# so there is no second verbosity control to find: Verbose gets the fuller
+# description, Brief gets the short word. "Off" also gets the short word --
+# that setting is about naming Unicode characters, and emoticons have their
+# own switch ("Speak text emoticons") for being turned off altogether.
 _EMOTICONS = {
-    ":-)": "smiley face", ":)": "smiley face",
-    ":-(": "sad face", ":(": "sad face",
-    ":-D": "grinning face", ":D": "grinning face",
-    ":-d": "grinning face", ":d": "grinning face",
-    ";-)": "winking face", ";)": "winking face",
-    ":-P": "tongue out", ":P": "tongue out",
-    ":-p": "tongue out", ":p": "tongue out",
-    ":-/": "confused face", ":/": "confused face",
-    ":-\\": "confused face", ":\\": "confused face",
-    ":-O": "surprised face", ":O": "surprised face",
-    ":-o": "surprised face", ":o": "surprised face",
-    ":-|": "neutral face", ":|": "neutral face",
-    ":-*": "kiss", ":*": "kiss",
-    ":'(": "crying face", ":'-(": "crying face",
-    ">:(": "angry face", ">:-(": "angry face",
-    "<3": "heart", "</3": "broken heart",
-    "XD": "laughing", "xD": "laughing",
-    "T_T": "crying", "T.T": "crying",
-    "O_O": "shocked", "o_o": "shocked", "O.O": "shocked",
-    "^_^": "happy", "^-^": "happy", "^^": "happy",
-    ">_<": "frustrated", ">.<": "frustrated",
-    "-_-": "unamused", "-.-": "unamused",
-    "B-)": "cool face", "B)": "cool face",
-    "8-)": "cool face", "8)": "cool face",
-    "D:": "horrified",
-    ">:)": "evil grin", ">:-)": "evil grin",
-    "¯\\_(ツ)_/¯": "shrug",
-    "(╯°□°)╯︵ ┻━┻": "table flip",
-    "ಠ_ಠ": "disapproval",
+    ":-)": ("smiley", "smiley face"), ":)": ("smiley", "smiley face"),
+    ":-(": ("frown", "sad face"), ":(": ("frown", "sad face"),
+    ":-D": ("grin", "grinning face"), ":D": ("grin", "grinning face"),
+    ":-d": ("grin", "grinning face"), ":d": ("grin", "grinning face"),
+    ";-)": ("wink", "winking face"), ";)": ("wink", "winking face"),
+    ":-P": ("tongue", "tongue out"), ":P": ("tongue", "tongue out"),
+    ":-p": ("tongue", "tongue out"), ":p": ("tongue", "tongue out"),
+    ":-/": ("confused", "confused face"), ":/": ("confused", "confused face"),
+    ":-\\": ("confused", "confused face"), ":\\": ("confused", "confused face"),
+    ":-O": ("surprised", "surprised face"), ":O": ("surprised", "surprised face"),
+    ":-o": ("surprised", "surprised face"), ":o": ("surprised", "surprised face"),
+    ":-|": ("neutral", "neutral face"), ":|": ("neutral", "neutral face"),
+    ":-*": ("kiss", "kiss"), ":*": ("kiss", "kiss"),
+    ":'(": ("crying", "crying face"), ":'-(": ("crying", "crying face"),
+    ">:(": ("angry", "angry face"), ">:-(": ("angry", "angry face"),
+    "<3": ("heart", "heart"), "</3": ("broken heart", "broken heart"),
+    "XD": ("laughing", "laughing"), "xD": ("laughing", "laughing"),
+    "T_T": ("crying", "crying"), "T.T": ("crying", "crying"),
+    "O_O": ("shocked", "shocked"), "o_o": ("shocked", "shocked"),
+    "O.O": ("shocked", "shocked"),
+    "^_^": ("happy", "happy"), "^-^": ("happy", "happy"),
+    "^^": ("happy", "happy"),
+    ">_<": ("frustrated", "frustrated"), ">.<": ("frustrated", "frustrated"),
+    "-_-": ("unamused", "unamused"), "-.-": ("unamused", "unamused"),
+    "B-)": ("cool", "cool face"), "B)": ("cool", "cool face"),
+    "8-)": ("cool", "cool face"), "8)": ("cool", "cool face"),
+    "D:": ("horrified", "horrified"),
+    ">:)": ("evil grin", "evil grin"), ">:-)": ("evil grin", "evil grin"),
+    "\u00af\\_(\u30c4)_/\u00af": ("shrug", "shrug"),
+    "(\u256f\u00b0\u25a1\u00b0)\u256f\ufe35 \u253b\u2501\u253b": ("table flip", "table flip"),
+    "\u0ca0_\u0ca0": ("disapproval", "disapproval"),
 }
 _EMOTICON_PATTERN = None
 
@@ -271,13 +285,19 @@ def _build_emoticon_pattern():
     )
 
 
-def _expand_emoticons(text):
-    """Replace text emoticons with their spoken descriptions."""
+def _expand_emoticons(text, verbosity="brief"):
+    """Replace text emoticons with their spoken names.
+
+    ``verbosity`` is the Unicode character names setting: "verbose" gets the
+    fuller description, anything else the short word. See _EMOTICONS.
+    """
     if _EMOTICON_PATTERN is None:
         _build_emoticon_pattern()
 
+    index = 1 if verbosity == "verbose" else 0
+
     def _replace(match):
-        return f" {_EMOTICONS[match.group(0)]} "
+        return f" {_EMOTICONS[match.group(0)][index]} "
 
     result = _EMOTICON_PATTERN.sub(_replace, text)
     return _re.sub(r"  +", " ", result).strip()
@@ -2251,7 +2271,8 @@ def _apply_patches():
                         if _config.speak_emojis:
                             seg_text = _expand_emojis(seg_text, lang_code)
                         if _config.speak_emoticons:
-                            seg_text = _expand_emoticons(seg_text)
+                            seg_text = _expand_emoticons(
+                                seg_text, _config.unicode_verbosity)
                         # Mark a language boundary the way Orca marks a
                         # pause: end the previous segment with a full stop
                         # and let the synthesiser's own sentence prosody
@@ -2289,7 +2310,7 @@ def _apply_patches():
         # Emoticon expansion
         try:
             if _config.speak_emoticons and text and isinstance(text, str):
-                text = _expand_emoticons(text)
+                text = _expand_emoticons(text, _config.unicode_verbosity)
         except Exception as e:
             _debug(f"_speak emoticon: ERROR {e}")
 
@@ -2639,7 +2660,7 @@ def _apply_patches():
             # through here.
             try:
                 if _config.speak_emoticons and text and isinstance(text, str):
-                    text = _expand_emoticons(text)
+                    text = _expand_emoticons(text, _config.unicode_verbosity)
             except Exception as e:
                 _debug(f"adjust_for_presentation emoticons: ERROR {e}")
             try:

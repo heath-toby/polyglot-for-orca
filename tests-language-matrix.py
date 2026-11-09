@@ -745,13 +745,34 @@ check("adjust_for_presentation is Polyglot's",
       "_patched_adjust" in getattr(_adjust, "__name__", ""), True)
 
 _saved_emoticons = c.speak_emoticons
+_saved_verbosity = c.unicode_verbosity
 c.speak_emoticons = True
-check("a smiley is announced when a line is read",
-      "smiley face" in _adjust(None, "hello :)"), True)
-check("a sad face is announced", "sad face" in _adjust(None, "oh no :("), True)
-check("a winking face is announced", "winking face" in _adjust(None, "sure ;)"), True)
+
+# Brief is what macOS VoiceOver says and what Toby is used to -- the one
+# salient word, not a description. It follows the existing Unicode character
+# names setting rather than adding a second verbosity control.
+c.unicode_verbosity = "brief"
+check("brief says smiley, not smiley face",
+      _adjust(None, "hello :)"), "hello smiley")
+check("brief says frown for a sad face", _adjust(None, "oh no :("), "oh no frown")
+check("brief says wink", _adjust(None, "sure ;)"), "sure wink")
 check("an emoticon mid-sentence is announced",
-      "grinning face" in _adjust(None, "well :D indeed"), True)
+      _adjust(None, "well :D indeed"), "well grin indeed")
+
+c.unicode_verbosity = "verbose"
+check("verbose keeps the fuller description",
+      _adjust(None, "hello :)"), "hello smiley face")
+check("verbose says sad face", _adjust(None, "oh no :("), "oh no sad face")
+check("verbose says winking face", _adjust(None, "sure ;)"), "sure winking face")
+
+# "Off" is about naming Unicode characters; emoticons have their own switch,
+# so off is not silence -- it is the short word.
+c.unicode_verbosity = "off"
+check("off still announces, briefly", _adjust(None, "hello :)"), "hello smiley")
+check("...and every entry has both names to choose from",
+      all(isinstance(v, tuple) and len(v) == 2 for v in si._EMOTICONS.values()),
+      True)
+c.unicode_verbosity = "brief"
 
 # Ordering: the Unicode pass renames any character it thinks unspeakable, which
 # takes a non-ASCII emoticon apart -- "¯" becomes "macron" -- so emoticons have
@@ -765,9 +786,10 @@ check("a bare colon is not an emoticon",
 check("a time is not an emoticon", "smiley" not in _adjust(None, "at 10:00"), True)
 
 c.speak_emoticons = False
-check("and the setting is honoured when off",
+check("and the emoticon switch is honoured when off",
       "smiley" not in _adjust(None, "hello :)"), True)
 c.speak_emoticons = _saved_emoticons
+c.unicode_verbosity = _saved_verbosity
 
 # --- the voice patch must accept everything upstream's does --------------
 # Upstream is voice(self, key=None, context=None, *, obj, string, language,

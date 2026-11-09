@@ -1194,7 +1194,10 @@ class PolyglotSettingsWindow(Gtk.Window):
             "Speak text _emoticons",
             self._config.speak_emoticons,
             atk_name="Speak text emoticons",
-            atk_desc="Text emoticons like :) and :( are spoken as descriptions")
+            atk_desc="Text emoticons like :) and :( are announced. The "
+                     "Unicode character names setting above chooses the "
+                     "wording: Brief says smiley and frown, Verbose says "
+                     "smiley face and sad face")
         listbox.add_row_with_widget(row, self._emoticon_switch)
 
         page.pack_start(listbox, False, False, 0)

@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.10.0
+
+**Emoticons are announced the way VoiceOver says them, and the wording follows
+the verbosity setting you already have.** Toby: *"I don't think I've ever seen
+smiley face. I'm more used to just smiley, frown, wink, which is what MacOS
+VoiceOver would say, and it's a bit more brief, per the brief mode Polyglot
+has."*
+
+The pronunciations are a hardcoded table, not a looked-up list, so the wording
+was entirely ours to choose — and it had only one form, the longer one. Each
+entry now carries both:
+
+- `:)` — brief "smiley", verbose "smiley face"
+- `:(` — brief "frown", verbose "sad face"
+- `;)` — brief "wink", verbose "winking face"
+- `:D` — brief "grin", verbose "grinning face"
+- `:/` — brief "confused", verbose "confused face"
+- `:O` — brief "surprised", verbose "surprised face"
+- `B)` — brief "cool", verbose "cool face"
+
+Which one you get follows the existing **Unicode character names** setting
+rather than adding a second verbosity control to hunt for: *Verbose* gets the
+description, *Brief* gets the one salient word. Toby's is already Brief, so
+this takes effect with nothing to configure.
+
+*Off* also gets the short word rather than silence. That setting is about
+naming Unicode characters, and emoticons have their own switch — "Speak text
+emoticons" — for turning them off altogether. The accessible description on
+that switch now says which setting controls the wording; its visible label is
+unchanged.
+
+Entries whose name was already a single word — shrug, heart, laughing,
+shocked, happy, frustrated, unamused, horrified, table flip, disapproval — are
+the same in both.
+
+117 rows in the matrix suite: each wording at Brief and at Verbose, "off"
+falling back to brief, every entry carrying both names, and the earlier rows
+still holding — a non-ASCII emoticon surviving the Unicode pass, and a bare
+colon or a clock time left alone.
+
 ## 2.9.1
 
 **Emoticons were never announced when reading a line.** Reported by Toby:
