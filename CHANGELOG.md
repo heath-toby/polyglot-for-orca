@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.10.1
+
+Declares `WEBSITE`, so [Extension Updater][eu] can find this add-on's
+releases. Orca reads that field with `ast`, without importing the extension,
+and shows it as a link in Preferences -> User Extensions -> Info.
+
+No behaviour changes.
+
+[eu]: https://github.com/heath-toby/orca-extension-updater
+
 ## 2.10.0
 
 **Emoticons are announced the way VoiceOver says them, and the wording follows
