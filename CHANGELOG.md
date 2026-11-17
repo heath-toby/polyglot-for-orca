@@ -1,5 +1,70 @@
 # Changelog
 
+## 2.11.0
+
+**Each language on a braille line now shows in its own table.**
+
+An English sentence with a Russian phrase in it reads as English braille then
+Russian braille, on one line. Until now braille could only ever be in one
+table at a time, so Polyglot picked one per line: correct for the majority of
+the line and wrong for the rest. For "the word is привет here" with an English
+table, the Russian degraded to liblouis hex escapes -- 59 cells for a
+23-character line, which does not even fit on a 40-cell display. Per run it is
+17 cells and reads properly.
+
+The approach is taken from the NVDA add-on BrailleLanguageSwitcher: Orca
+contracts each region with one `louis.translate` call returning the cells and
+two position maps, and that call is wrapped so each language run is translated
+with its own table and the maps are rejoined with their offsets corrected.
+Routing, the cursor and panning read those maps, so the maps are where the
+risk is and where the tests are.
+
+**BrlTTY turned out not to be the obstacle, and is now left alone entirely.**
+BRLAPI's own documentation says its text path is a one-to-one character table
+and that a client wanting contraction should do it itself and send dot
+patterns. So liblouis is asked for dots rather than letters, by prefixing
+`unicode.dis`, and BrlTTY renders the U+2800 block verbatim whatever its table
+says. Consequences:
+
+- `brlapi.setParameter` is no longer called at all. In the 2MB of log before
+  this change there were 40 table-switching calls; after it, none. That is the
+  round trip that once stopped Orca for 49 seconds with no display attached,
+  gone rather than worked around.
+- The display's **input** table is left where you put it. It was the same
+  table Polyglot was changing underneath it, which is what made input tables a
+  nuisance.
+
+### How a run's table is chosen
+
+- **Script** decides first, and needs no minimum length: one Cyrillic word is
+  Cyrillic however few words surround it. This matters because a braille line
+  is short and the statistical detector declines anything under eight words,
+  so on braille it would almost always decline.
+- **A line script cannot place at all** -- a wholly German line, there being no
+  German script -- takes the language Polyglot detected for the line, which is
+  what the old per-line switching used. Without this a German line would have
+  regressed to the default table.
+- **On a mixed line**, the parts script could not place take the configured
+  default language, not the line's dominant one, or a Russian-dominant line
+  would put its English words in a Russian table.
+- **Where languages share a script**, the statistical detector is consulted,
+  but a run is believed only if it holds at least *Minimum words to switch*
+  natural words. Found on the Mantis within a minute of switching this on: a
+  KeePassXC notification ending in `/usr/bin/gh` came back with that path
+  marked German and showed it in a German table.
+
+### Also
+
+- New setting, **braille-mixed-language**, on by default.
+- New `tools/braille-tables.py`: a line translated three ways, as braille, dot
+  numbers and BRLAPI bytes.
+- New `tools/braille-trace.py --check`: re-translates the lines Polyglot put on
+  the display and compares, which is the one check reading the display cannot
+  perform.
+- Contracted braille must be on for any of this to run, since it is the only
+  path on which Orca translates. With it off the log says so, rather than
+  nothing happening for no visible reason.
+
 ## 2.10.1
 
 Declares `WEBSITE`, so [Extension Updater][eu] can find this add-on's

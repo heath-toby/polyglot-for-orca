@@ -66,6 +66,11 @@ _DEFAULTS = {
     "speak_emoticons": True,
     "enable_mixed_language": False,
     "mixed_max_words": 600,
+    # Each language run of a braille line shown in its own table. On by
+    # default: it is what the braille display should have been doing all
+    # along, and with it on Polyglot stops changing BRLTTY's table, which
+    # is what used to disturb the display's input table.
+    "braille_mixed_language": True,
     # off | markup_only | markup_text | always.
     # markup_text preserves prior behaviour: trust Orca's language hints
     # (markup, AT-SPI, Orca's own detector) when present, else fall back
@@ -108,6 +113,7 @@ _TOP_LEVEL_KEYS = (
     ("speak_emoticons", "speak-emoticons", "bool"),
     ("enable_mixed_language", "enable-mixed-language", "bool"),
     ("mixed_max_words", "mixed-max-words", "int"),
+    ("braille_mixed_language", "braille-mixed-language", "bool"),
     ("detection_mode", "detection-mode", "str"),
     ("ignored_apps", "ignored-apps", "strlist"),
     ("detection_order", "detection-order", "strlist"),
@@ -400,6 +406,7 @@ class Config:
         self.switch_confidence = _DEFAULTS["switch_confidence"]
         self.speak_emoticons = _DEFAULTS["speak_emoticons"]
         self.enable_mixed_language = _DEFAULTS["enable_mixed_language"]
+        self.braille_mixed_language = _DEFAULTS["braille_mixed_language"]
         self.mixed_max_words = _DEFAULTS["mixed_max_words"]
         self.detection_mode = _DEFAULTS["detection_mode"]
         self.ignored_apps = list(_DEFAULTS["ignored_apps"])
@@ -695,6 +702,8 @@ class Config:
             self.switch_confidence = data.get("switch_confidence", self.switch_confidence)
             self.speak_emoticons = data.get("speak_emoticons", self.speak_emoticons)
             self.enable_mixed_language = data.get("enable_mixed_language", self.enable_mixed_language)
+            self.braille_mixed_language = data.get(
+                "braille_mixed_language", self.braille_mixed_language)
             self.mixed_max_words = data.get("mixed_max_words", self.mixed_max_words)
             mode = data.get("detection_mode", self.detection_mode)
             if mode in ("off", "markup_only", "markup_text", "always"):
@@ -724,6 +733,7 @@ class Config:
             "switch_confidence": self.switch_confidence,
             "speak_emoticons": self.speak_emoticons,
             "enable_mixed_language": self.enable_mixed_language,
+            "braille_mixed_language": self.braille_mixed_language,
             "mixed_max_words": self.mixed_max_words,
             "detection_mode": self.detection_mode,
             "ignored_apps": self.ignored_apps,

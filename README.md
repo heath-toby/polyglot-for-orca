@@ -30,12 +30,12 @@ the voice set you configured for it. See [Voices](#voices).
 
 ### Language Switching
 - **Automatic voice switching** -- detects the language of text as it is spoken and tags the utterance with that language. Orca then applies the voice you configured for it in **Orca Preferences -> Voice Sets**, with its rate, pitch, inflection and volume. Polyglot deliberately stores no voices of its own; see [Voices](#voices).
-- **Mixed-language support** -- optionally detects multiple languages on the same line and speaks each segment with the correct voice (speech only; braille stays on the whole-line language since only one table can be active).
+- **Mixed-language support** -- detects multiple languages on the same line and speaks each segment with the correct voice **and shows each in its own braille table**, so an English sentence with a Russian phrase in it reads as English braille then Russian braille on one line.
 - **Characters follow their line** -- arrowing through a line announces each character, comma and space in that line's language. A character has no language of its own, so the line it sits in is the only sensible answer, and the answer comes from asking the object Orca is speaking about rather than from anything Polyglot remembers. A non-Latin character still overrides it, so a Cyrillic letter in a German line is read as Russian.
 - **Window chrome stays in the system language** -- a button, a menu item or a tab is not text, which is what tells Polyglot it is looking at the window's own furniture rather than at content. Those are read in your default language, so short labels are not announced in the language of whatever document you were just in.
 - **Typing learns as you go** -- typed text has no object to ask, which is what distinguishes it from navigation. It starts in whichever language was previous and switches once enough words have accumulated to be sure.
-- **Braille contraction table switching** -- automatically sets the correct liblouis contraction table for contracted braille output.
-- **BrlTTY text table switching** -- keeps the BrlTTY computer braille (text) table in sync with the detected language, so character-to-dot mappings are always correct.
+- **Braille contraction table switching** -- picks the liblouis contraction table per language *run* within a line, falling back to the line's own language where a run has no script of its own to go by.
+- **No BrlTTY table switching** -- it is no longer needed, and not doing it is better. Cells leave Orca as Unicode braille, which BrlTTY renders verbatim whatever its own table says, so the table Polyglot used to change per line is left alone. That removes the `brlapi.setParameter` round trip that could stop Orca outright, and leaves the display's **input** table where you put it, since it was the same table.
 - **Three-tier detection** -- Unicode script analysis (instant, for Cyrillic, Arabic, Hebrew, Greek, CJK, etc.), then plain word lists (counts how many words belong to each language and to no other), then the [Lingua](https://github.com/pemistahl/lingua-py) library for anything the word lists cannot settle. The order is configurable. See [Word lists](#word-lists).
 - **Default language bias** -- the default language is given priority to prevent false switches on short technical text like terminal commands.
 - **Uppercase voice preservation** -- uppercase pitch changes and other voice-type overrides (hyperlink, system) keep working across a language switch, because Orca resolves the voice type inside the language's voice set.
@@ -346,6 +346,77 @@ Language detection uses three tiers, in a configurable order:
 3. **Lingua statistical detection** (slower) -- distinguishes between Latin-script languages (English vs German vs French etc.) using n-gram models. A confidence threshold and noise filter prevent false switches on technical text.
 
 A tier that cannot answer passes the question down, and if none of them can, the language already in use is kept.
+
+### Mixed-language braille
+
+Orca contracts each braille region with a single `louis.translate` call that
+returns the cells plus two maps: the text offset of every cell, and the cell of
+every text offset. Routing keys, the cursor, attribute underlining and panning
+all read those maps. Polyglot wraps that one call: the line is split into
+language runs, each run is translated with its own table, and the cells and
+both maps are joined back together with their offsets corrected. The approach
+is taken from the NVDA add-on
+[BrailleLanguageSwitcher](https://github.com/heath-toby/brailleLanguageSwitcher),
+which wraps NVDA's equivalent call.
+
+BrlTTY looks as though it should make this impossible, since Orca sends text
+and BrlTTY turns text into dots. It does not, and BRLAPI says so itself: its
+text path is a one-to-one character table, and a client wanting contraction
+should "perform it itself (e.g. thanks to liblouis) and send the resulting dot
+patterns ... exactly the same problem as font rendering on a graphical
+display". Orca already does that for contracted braille.
+
+So Polyglot asks liblouis for dots rather than letters, by prefixing
+`unicode.dis` to the table list. The result is U+2800-block characters whose
+low byte *is* the dot pattern, and BrlTTY renders those verbatim -- its
+`ttb_translate.c` checks for the Unicode braille row and returns the cell
+unchanged, whatever text table is loaded.
+
+Two things decide a run's table:
+
+1. **Script**, which is certain and needs no minimum length. One Cyrillic word
+   in an English sentence is Cyrillic whether or not there are eight words
+   around it -- which matters, because a braille line is short and the
+   statistical detector declines anything under eight words.
+2. **The line's own detected language**, for a line script cannot place at all.
+   There is no German script, so a wholly German line is invisible to script
+   detection; it takes the language Polyglot detected for the line, which is
+   what the old per-line table switching used.
+
+On a *mixed* line the parts script could not place take the configured default
+language rather than the line's dominant one, or a line where Russian
+dominates would put its English words in a Russian table.
+
+Where several languages share a script, the statistical detector is consulted
+for the runs script left undecided -- but a run is believed only if it holds at
+least **Minimum words to switch** natural words. Without that guard a file path
+such as `/usr/bin/gh` came back marked German and was shown in a German table.
+
+**Contracted braille must be on** (Orca Preferences, Braille), because that is
+the only path on which Orca translates anything. With it off, mixed braille is
+inert and says so in the log.
+
+Known limits: emphasis typeform is still computed with the region's default
+table, so emphasis signs inside a non-default run come from the wrong table's
+rules; and a line longer than 2000 characters is shown in one table rather than
+segmented.
+
+#### Seeing what it did
+
+    ./tools/braille-tables.py "the word is привет here"
+
+shows a line translated three ways -- one table, the dominant language's table,
+and a table per run -- as braille, as dot numbers and as the bytes BRLAPI
+receives, so a cell can be checked by hand against a table chart.
+
+    ORCA_POLYGLOT_DEBUG=1       # then restart Orca
+    ./tools/braille-trace.py --check
+
+reads back the lines Polyglot actually put on the display, re-translates each
+one here, and compares. Agreement means the cells on the display are the cells
+the tables call for, which is the one thing reading the display cannot tell
+you: a wrong cell still feels like a cell.
+
 
 ## Troubleshooting
 

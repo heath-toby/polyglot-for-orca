@@ -846,6 +846,8 @@ def _expand_unpronounceable(text, verbosity="verbose"):
 _installed = False
 _detector = None
 _config = None
+#: The mixed-table braille translator, when it is in place. See mixed_braille.
+_mixed_braille = None
 _current_language = None
 # The languages Polyglot is configured for. Serves the membership test
 # that _lang_acss_cache used to: "is this a language we handle?"
@@ -871,6 +873,115 @@ def _add_venv_to_path():
             sys.path.insert(0, sp)
             break
 
+
+
+# --- Mixed-table braille ----------------------------------------------------
+
+#: Tables for the two sentinel "languages" that only ever meant a braille
+#: table. Polyglot used to set these for a whole line; per run is strictly
+#: better, since an IPA phrase inside English prose now gets the IPA table
+#: for the phrase alone rather than for the sentence around it.
+_SENTINEL_BRAILLE_TABLES = {
+    "ipa": "/usr/share/liblouis/tables/IPA.utb",
+    "unicode_braille": "/usr/share/liblouis/tables/unicode-braille.utb",
+}
+
+
+def _braille_table_for(lang_code):
+    """The contraction table for a language, or None to keep Orca's own."""
+
+    if not lang_code or _config is None:
+        return None
+    settings = _config.language_settings.get(lang_code, {})
+    table = settings.get("contraction_table", "")
+    if table:
+        return table
+    return _SENTINEL_BRAILLE_TABLES.get(lang_code)
+
+
+def _statistical_runs(text):
+    """Language runs from the mixed detector, for languages sharing a script.
+
+    Script cannot tell English from German. This can, but only with enough
+    words to be worth believing, and it says so by returning None -- which
+    is the common answer for a braille line, and why script does the work.
+
+    **A run is believed only if it has real words in it.** Found on the
+    Mantis within a minute of switching this on: a KeePassXC notification
+    ending in the path ``/usr/bin/gh`` came back with that path marked
+    German, and the path was then shown in a German grade-1 table. Lingua is
+    handed raw text, noise and all, because character offsets are what we
+    need back from it. So each run is weighed with Polyglot's own noise
+    filter, and a run without the configured number of natural words keeps
+    the default table rather than changing to one it cannot justify. A
+    wrongly contracted word on a forty-cell display is not a small thing.
+
+    The language is cleared rather than the run dropped, so the runs still
+    reconstruct the text exactly -- which is what makes them placeable.
+    """
+
+    if _detector is None or _config is None or not _config.enable_mixed_language:
+        return None
+    runs = _detector.detect_mixed(text)
+    if not runs:
+        return None
+
+    from .language_detector import LanguageDetector
+
+    threshold = max(1, int(_config.word_threshold or 1))
+    guarded = []
+    for run_text, lang_code in runs:
+        if len(LanguageDetector._natural_words(run_text)) < threshold:
+            lang_code = None
+        guarded.append((run_text, lang_code))
+    return guarded
+
+
+def _install_mixed_braille():
+    """Put the mixed-table translator in front of Orca's liblouis call."""
+
+    global _mixed_braille
+
+    if _mixed_braille is not None and _mixed_braille.installed:
+        return
+    if _config is None or not _config.braille_mixed_language:
+        return
+
+    # Nothing here may raise. This runs inside Polyglot's install, which runs
+    # from on_ready; a failure part-way through would leave Polyglot half
+    # patched, and braille that cannot be in two tables is a small loss
+    # beside a screen reader that is.
+    try:
+        from .language_detector import _get_script
+        from .mixed_braille import MixedBraille
+
+        _mixed_braille = MixedBraille(
+            table_for=_braille_table_for,
+            script_map=lambda: (_config.script_to_language if _config else {}),
+            get_script=_get_script,
+            log=_debug,
+            statistical=_statistical_runs,
+            line_language=_language_of_line,
+            default_language=lambda: (_config.default_language if _config else None),
+        )
+        if not _mixed_braille.install():
+            _mixed_braille = None
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        log.warning(f"Polyglot: mixed braille unavailable: {error!r}")
+        _mixed_braille = None
+
+
+def _uninstall_mixed_braille():
+    """Put Orca's liblouis call back."""
+
+    global _mixed_braille
+
+    if _mixed_braille is not None:
+        try:
+            _mixed_braille.uninstall()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.warning(f"Polyglot: mixed braille would not come out: {error!r}")
+        _mixed_braille = None
 
 def install(config=None):
     """Install the language-switching monkey-patches into Orca's speech system.
@@ -942,6 +1053,7 @@ def install(config=None):
     _detector.current_language = _current_language
 
     _rebuild_configured_languages()
+    _install_mixed_braille()
     _installed = True
 
     lang_count = len(_config.enabled_languages)
@@ -1814,6 +1926,13 @@ def _set_contraction_table(table_path):
     """
     global _current_contraction_table
 
+    if _mixed_braille is not None and _mixed_braille.installed:
+        # Mixed braille picks a table per language run, so a table set for
+        # the whole line would only fight it: the run that matched no
+        # language falls back to whatever this left behind, which would then
+        # wander with the last line read.
+        return
+
     if table_path == _current_contraction_table:
         return
 
@@ -1887,6 +2006,13 @@ def _set_brltty_text_table(lang_code):
     and the worker is what makes it survivable rather than merely unlikely.
     """
     global _current_brltty_text_table, _brltty_display_seen
+
+    if _mixed_braille is not None and _mixed_braille.installed:
+        # Nothing to set. Every cell now leaves Orca as a U+2800 character,
+        # which BRLTTY renders verbatim whatever its text table says, so the
+        # table is no longer ours to change -- and leaving it alone leaves
+        # the display's input table alone with it.
+        return
 
     present = _braille_display_present()
     reconnected = present and not _brltty_display_seen
@@ -2946,6 +3072,7 @@ def uninstall():
     if not _installed:
         return
 
+    _uninstall_mixed_braille()
     _unpatch_all()
     _restore_orca_state()
 
