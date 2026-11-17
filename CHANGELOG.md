@@ -1,5 +1,54 @@
 # Changelog
 
+## 3.2.1
+
+Making the seam between two voices as short as it can be, which turns out to
+be mostly not ours to decide.
+
+**Measured first.** Identical text either side of the seam, so duration could
+not be mistaken for delay (the first attempt had the two voices reading
+*different* text and gave a figure 100 ms too high):
+
+1. One message, one voice -- 0.97 s for the test line.
+2. Splitting into two messages, same voice -- about **33 ms** more.
+3. Each change of voice -- about **150 ms** more. The first change costs
+   nearer 300 ms and later ones settle around 145, both voices staying warm.
+
+So the pause is almost entirely voxin rebuilding its engine for a different
+voice, not Polyglot's splitting. All three of Toby's voices live in the same
+output module, so no module switch is involved. Dialingo's own scheduler names
+this engine family for exactly this: *"some drivers stop their audio, or
+rebuild their engine, to change voice (Vocalizer, SAPI 5)"*.
+
+**Why Dialingo sounds better, and why Orca cannot copy it.** Dialingo hosts the
+synthesizers itself and puts a queue in front of NVDA's audio player. It scans
+the synthesized audio for the last sample above a measured loudness floor (32
+of 32767, calibrated per voice), cuts the trailing silence there, and places a
+callback probe so it knows when the audio up to that point has *played* --
+then starts the next voice. It is not waiting for the engine to say it has
+finished, because engines pad their utterances and report late. Orca hands
+text to speech-dispatcher over SSIP and never sees a sample of audio, so there
+is nothing to trim and no probe to place.
+
+**What did improve:**
+
+1. **No invented full stop at a seam.** The flush now works by repeating the
+   run's own ACSS rather than by inserting a `Pause`. Orca appends `"."` at
+   every pause when the run ends in a letter, and a sentence-final fall is the
+   one thing that makes a language boundary sound like the end of a sentence.
+   The ACSS branch of `_speak_list` flushes without adding anything.
+2. **`speech_min_run_words`**, new setting, default 1 (no change in
+   behaviour). Above 1, a run shorter than that many words is given to its
+   neighbour rather than its own voice. At 150 ms a change, a one-word run
+   costs about 300 ms in and out to buy one correctly pronounced word -- which
+   may well be worth it, so this is a setting and not a rule. **Braille is
+   untouched: changing table per run costs nothing, so braille still switches
+   on every run however short.**
+3. **A whitespace-only run no longer causes a split.** The space between two
+   English runs sometimes comes back labelled as a third language, and the
+   line was being rebuilt to say exactly what it said before -- in two
+   synthesizer calls instead of one, paying the 150 ms for nothing.
+
 ## 3.2.0
 
 **Mixed-language speech now works on a line read.** It never had. Toby found

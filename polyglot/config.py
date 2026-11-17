@@ -78,6 +78,11 @@ _DEFAULTS = {
     # Decide a braille line too short to identify by the sentences around
     # it in the focused object, rather than by the line alone.
     "braille_line_context": True,
+    # Words a run needs before it is given its own *voice*. Braille still
+    # switches table per run, which costs nothing; a voice change costs
+    # about 150 ms on voxin, so a one-word run can cost 300 ms in and out
+    # to gain one correctly pronounced word. 1 switches on every run.
+    "speech_min_run_words": 1,
     # off | markup_only | markup_text | always.
     # markup_text preserves prior behaviour: trust Orca's language hints
     # (markup, AT-SPI, Orca's own detector) when present, else fall back
@@ -123,6 +128,7 @@ _TOP_LEVEL_KEYS = (
     ("braille_mixed_language", "braille-mixed-language", "bool"),
     ("braille_join_emphasis", "braille-join-emphasis", "bool"),
     ("braille_line_context", "braille-line-context", "bool"),
+    ("speech_min_run_words", "speech-min-run-words", "int"),
     ("detection_mode", "detection-mode", "str"),
     ("ignored_apps", "ignored-apps", "strlist"),
     ("detection_order", "detection-order", "strlist"),
@@ -418,6 +424,7 @@ class Config:
         self.braille_mixed_language = _DEFAULTS["braille_mixed_language"]
         self.braille_join_emphasis = _DEFAULTS["braille_join_emphasis"]
         self.braille_line_context = _DEFAULTS["braille_line_context"]
+        self.speech_min_run_words = _DEFAULTS["speech_min_run_words"]
         self.mixed_max_words = _DEFAULTS["mixed_max_words"]
         self.detection_mode = _DEFAULTS["detection_mode"]
         self.ignored_apps = list(_DEFAULTS["ignored_apps"])
@@ -719,6 +726,8 @@ class Config:
                 "braille_join_emphasis", self.braille_join_emphasis)
             self.braille_line_context = data.get(
                 "braille_line_context", self.braille_line_context)
+            self.speech_min_run_words = data.get(
+                "speech_min_run_words", self.speech_min_run_words)
             self.mixed_max_words = data.get("mixed_max_words", self.mixed_max_words)
             mode = data.get("detection_mode", self.detection_mode)
             if mode in ("off", "markup_only", "markup_text", "always"):
@@ -751,6 +760,7 @@ class Config:
             "braille_mixed_language": self.braille_mixed_language,
             "braille_join_emphasis": self.braille_join_emphasis,
             "braille_line_context": self.braille_line_context,
+            "speech_min_run_words": self.speech_min_run_words,
             "mixed_max_words": self.mixed_max_words,
             "detection_mode": self.detection_mode,
             "ignored_apps": self.ignored_apps,

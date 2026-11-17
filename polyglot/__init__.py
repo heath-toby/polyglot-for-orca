@@ -22,7 +22,7 @@ Public License for more details. You should have received a copy of it
 along with this program; if not, see <https://www.gnu.org/licenses/>.
 """
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 
 import logging
 
@@ -59,7 +59,7 @@ class Polyglot(Extension):
 
     GROUP_LABEL = "Polyglot"
     DESCRIPTION = "Detects the language of text as Orca speaks it and switches voice and braille contraction table to match, and announces emoji, emoticons and Unicode characters by name."
-    VERSION = "3.2.0"  # keep in sync with __version__; read by AST, must be a literal
+    VERSION = "3.2.1"  # keep in sync with __version__; read by AST, must be a literal
     AUTHOR = "Toby"
     # Read by Orca without importing this module, and by Extension Updater
     # to find this add-on's releases. Orca shows it as a link in

@@ -2373,6 +2373,38 @@ def _end_with_boundary(text: str) -> str:
 
 
 
+def merge_short_runs(runs, min_words):
+    """Give a run too short to be worth its own voice to its neighbour.
+
+    A voice change costs about 150 ms on voxin -- measured, identical text
+    either side -- because the engine rebuilds itself for a different
+    voice. Orca cannot avoid that: it hands text to speech-dispatcher and
+    never sees the audio, so it cannot trim the silence at a seam the way
+    an add-on that owns its own audio queue can.
+
+    So the only lever is switching less often. A one-word run costs around
+    300 ms, in and out, to buy one correctly pronounced word -- which may
+    well be worth it, since pronunciation is the whole point. Hence a
+    setting rather than a rule, defaulting to 1: switch on every run,
+    as before.
+
+    Braille is untouched by this. Changing table per run costs nothing.
+    """
+    if min_words <= 1:
+        return runs
+    merged = []
+    for text, lang in runs:
+        if merged and len(text.split()) < min_words:
+            # Keep the words, drop the claim about their language.
+            merged[-1] = (merged[-1][0] + text, merged[-1][1])
+            continue
+        if merged and merged[-1][1] == lang:
+            merged[-1] = (merged[-1][0] + text, lang)
+        else:
+            merged.append((text, lang))
+    return merged
+
+
 def split_utterance_list(content, segments_of, acss_of, pause, acss_type):
     """Rebuild one of Orca's utterance lists so each language gets its voice.
 
@@ -2405,21 +2437,42 @@ def split_utterance_list(content, segments_of, acss_of, pause, acss_type):
             rebuilt.append(element)
             continue
         runs = segments_of(element)
-        if not runs or len({lang for _t, lang in runs}) < 2:
+        if not runs:
             rebuilt.append(element)
             continue
+        # Count the languages *after* dropping runs that are only
+        # whitespace. A space between two English runs can come back
+        # labelled as a third language, and splitting on that rebuilds the
+        # list to say exactly what it said before -- in two synthesiser
+        # calls instead of one, which on this hardware is the expensive
+        # part.
+        runs = merge_short_runs(
+            runs, getattr(_config, "speech_min_run_words", 1))
         spoken_runs = [(text, lang) for text, lang in runs if text.strip()]
+        if len({lang for _t, lang in spoken_runs}) < 2:
+            rebuilt.append(element)
+            continue
         for index, (run_text, lang) in enumerate(spoken_runs):
             run_acss = acss_of(lang)
             if run_acss is not None and isinstance(run_acss, acss_type):
                 rebuilt.append(run_acss)
             rebuilt.append(run_text)
-            # Between the runs only. A trailing pause would make
-            # _speak_list append a full stop to the end of the line --
-            # Orca adds one at every pause -- and the last run needs no
-            # flush anyway: _speak_list speaks what is left over in the
-            # voice that is active when the list runs out.
-            if index + 1 < len(spoken_runs):
+            # Flush this run before the next voice claims it. Repeating
+            # this run's own ACSS is what does it: the ACSS branch of
+            # _speak_list flushes when text is already pending and the
+            # voice is about to change, and unlike the Pause branch it
+            # adds no full stop. A Pause would read "hello" as "hello."
+            # -- Orca appends one at every pause when the run ends in a
+            # letter -- and a sentence-final fall is the one thing that
+            # makes a language boundary sound like a full stop.
+            #
+            # The last run needs no flush: _speak_list speaks whatever is
+            # left over in the voice active when the list runs out.
+            if index + 1 < len(spoken_runs) and run_acss is not None:
+                rebuilt.append(run_acss)
+            elif index + 1 < len(spoken_runs):
+                # No ACSS for this run, so the repeat trick has nothing to
+                # repeat; a pause is the only flush left.
                 rebuilt.append(pause())
             split_anything = True
     return rebuilt if split_anything else None
