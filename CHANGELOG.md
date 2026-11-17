@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.12.0
+
+**An emphasis passage that crosses a change of table now opens in one table
+and closes in the other.**
+
+Translated run by run, liblouis closes an emphasis passage at the end of each
+run and opens it again at the start of the next, because each call is a line to
+itself and knows nothing of its neighbours. A bold phrase running from English
+into Russian therefore came out opened and closed twice. For "the word is
+really **привет** here" with the whole phrase bold:
+
+    before   ⠘⠶⠮⠀⠘⠺⠀⠊⠎⠀⠗⠂⠇⠇⠽⠘⠄⠀⠻⠏⠗⠊⠺⠑⠞⠻⠀⠐⠓    29 cells
+    after    ⠘⠶⠮⠀⠘⠺⠀⠊⠎⠀⠗⠂⠇⠇⠽⠀⠏⠗⠊⠺⠑⠞⠻⠀⠐⠓      26 cells
+
+It opens with UEB's `⠘⠶` and closes with the Russian table's `⠻`, and the
+redundant pair in the middle is gone.
+
+**The indicators are found by asking each table, not by knowing anything about
+it.** A probe is translated plain and emphasised; if the plain output appears
+whole inside the emphasised one, whatever sits either side of it is the pair.
+That holds for every wrapping table and fails cleanly for the rest, and the
+answer is remembered per table and class.
+
+**It joins only where both runs actually wrapped the passage.** This was the
+flaw in the first attempt, caught in testing: a table that *can* wrap still
+marks a short emphasis word by word -- UEB marks two bold words with an
+indicator before each rather than opening a passage -- so striking the opener
+off a neighbour that never opened anything left a terminator closing nothing.
+Both sides must have used the wrapping regime, which is visible in the output.
+
+Nothing else is touched: emphasis that stops at the boundary, a line with no
+emphasis, the word regime, and a table with no such class all come out exactly
+as before.
+
+### Added
+
+- Setting **braille-join-emphasis**, on by default, so the two behaviours can
+  be compared on the display.
+- 33 more test rows, most of them on the position maps after cells are removed:
+  taking an indicator out of the middle of a line is exactly the operation that
+  would make routing land one cell out.
+
+### Fixed
+
+- `liblouis.translate` mutates the typeform list it is given. Runs are handed a
+  slice, which is a fresh list, so Orca's own array is not disturbed -- but it
+  is worth knowing before reusing one.
+
 ## 2.11.1
 
 **Formatting marks work across mixed tables, and 2.11.0 was wrong to say they

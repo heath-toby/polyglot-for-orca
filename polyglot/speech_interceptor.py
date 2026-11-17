@@ -963,6 +963,8 @@ def _install_mixed_braille():
             statistical=_statistical_runs,
             line_language=_language_of_line,
             default_language=lambda: (_config.default_language if _config else None),
+            join_emphasis=lambda: bool(
+                _config.braille_join_emphasis if _config else True),
         )
         if not _mixed_braille.install():
             _mixed_braille = None

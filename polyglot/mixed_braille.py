@@ -149,6 +149,95 @@ def merge_runs(segments):
     return [(start, end, language) for start, end, language in merged]
 
 
+# The emphasis classes Orca can put in a typeform, with the bit liblouis uses
+# for each. The bit is a liblouis constant rather than something a table
+# chooses -- checked across every table installed -- which is why one typeform
+# computed with one table is correct for all of them.
+EMPHASIS_BITS: tuple[tuple[str, int], ...] = (
+    ("italic", 1),
+    ("underline", 2),
+    ("bold", 4),
+)
+
+#: Four words: enough text for a table to use its passage indicator rather
+#: than marking each word, which is the regime whose indicators can be joined.
+_PROBE = "aaa bbb ccc ddd"
+
+#: (table, bit) -> (opener, terminator), or None where the table interleaves
+#: its indicators instead of wrapping the passage. Probed once per pair.
+_wrap_cache: dict = {}
+
+
+def wrapping_indicators(translate, table, bit):
+    """Returns the (opener, terminator) a table wraps an emphasised passage in.
+
+    Returns None when the table marks emphasis *within* the text instead --
+    UEB marks two bold words with an indicator before each, and German bold
+    likewise. There is nothing to join in that case, and nothing is tried:
+    each run marks its own words in its own code, which already reads
+    sensibly.
+
+    Found by asking the table rather than by knowing anything about it. The
+    probe is translated plain and emphasised; if the plain output appears
+    whole inside the emphasised one, whatever sits either side of it is the
+    pair. That holds for every wrapping table and fails cleanly for the rest.
+    """
+
+    key = (table, bit)
+    if key in _wrap_cache:
+        return _wrap_cache[key]
+    result = None
+    try:
+        plain = translate([UNICODE_DIS, table], _PROBE, cursorPos=0)[0]
+        emphasised = translate(
+            [UNICODE_DIS, table], _PROBE, typeform=[bit] * len(_PROBE), cursorPos=0
+        )[0]
+        at = emphasised.find(plain)
+        if at >= 0:
+            opener = emphasised[:at]
+            terminator = emphasised[at + len(plain):]
+            if opener or terminator:
+                result = (opener, terminator)
+    except Exception:  # pylint: disable=broad-exception-caught
+        result = None
+    _wrap_cache[key] = result
+    return result
+
+
+def remove_cells(output, in_position, out_position, at, count):
+    """Removes `count` cells at `at`, keeping both maps consistent.
+
+    The cells removed are an emphasis indicator, so the map entries that
+    pointed at them are dropped rather than redirected, and every text offset
+    that pointed past them moves back. A text offset pointing *into* them is
+    clamped to where they were, which is the first cell of what follows.
+    """
+
+    if count <= 0 or at < 0 or at + count > len(output):
+        return output, in_position, out_position
+    kept_output = output[:at] + output[at + count:]
+    kept_in = in_position[:at] + in_position[at + count:]
+    kept_out = [
+        cell - count if cell >= at + count else (at if cell > at else cell)
+        for cell in out_position
+    ]
+    return kept_output, kept_in, kept_out
+
+
+def continuing_emphasis(typeform, boundary):
+    """Returns the emphasis bits set on both sides of `boundary`.
+
+    These are the spans that carry on across a change of table, and so the
+    ones whose indicators should open in the first table and close in the
+    last rather than being opened and closed twice.
+    """
+
+    if not typeform or boundary <= 0 or boundary >= len(typeform):
+        return ()
+    before, after = typeform[boundary - 1], typeform[boundary]
+    return tuple(bit for _name, bit in EMPHASIS_BITS if before & bit and after & bit)
+
+
 def segment_at(segments, position):
     """Returns the segment holding `position`, or the last one past the end."""
 
@@ -156,6 +245,45 @@ def segment_at(segments, position):
         if segment[0] <= position < segment[1]:
             return segment
     return segments[-1] if segments else None
+
+
+def join_indicators(translate, table, output, in_position, out_position,
+                    continues_in, continues_out):
+    """Removes the emphasis indicators a run should not repeat at a boundary.
+
+    A bold passage running from English into Russian should open once, in the
+    table it starts in, and close once, in the table it ends in. Translated
+    run by run, liblouis closes it at the end of the first run and opens it
+    again at the start of the second, because each call is a line to itself
+    and knows nothing of its neighbours. This takes those two out again.
+
+    The trailing terminator goes first so the leading opener's index is still
+    good. Where a table marks emphasis within the text instead of wrapping it
+    -- UEB with two bold words, German bold -- there is no pair to join and
+    nothing is touched.
+    """
+
+    for bit in continues_out:
+        pair = wrapping_indicators(translate, table, bit)
+        if not pair or not pair[1]:
+            continue
+        at = output.rfind(pair[1])
+        if at >= 0:
+            output, in_position, out_position = remove_cells(
+                output, in_position, out_position, at, len(pair[1])
+            )
+
+    for bit in continues_in:
+        pair = wrapping_indicators(translate, table, bit)
+        if not pair or not pair[0]:
+            continue
+        at = output.find(pair[0])
+        if at >= 0:
+            output, in_position, out_position = remove_cells(
+                output, in_position, out_position, at, len(pair[0])
+            )
+
+    return output, in_position, out_position
 
 
 def translate_segments(
@@ -167,6 +295,7 @@ def translate_segments(
     mode,
     comp_flag,
     extra_tables=(),
+    join_emphasis=True,
 ):
     """Translates each ``(start, end, table)`` of `inbuf` with its own table.
 
@@ -185,6 +314,8 @@ def translate_segments(
     in_position: list[int] = []
     out_position: list[int] = []
     cursor_position = None
+    #: Each run's translation, kept whole until the boundaries are settled.
+    parts: list[list] = []
 
     # No cursor asked for means no segment holds it, so every segment is
     # translated with the flag cleared and None is reported back.
@@ -219,14 +350,66 @@ def translate_segments(
             mode=part_mode,
         )
 
+        parts.append([part_out, list(part_in), list(part_rev), part_cursor, has_cursor])
+
+    if join_emphasis and typeform is not None and len(parts) > 1:
+        join_across_boundaries(translate, tabled, typeform, parts)
+
+    for (start, _end, _table), part in zip(tabled, parts):
+        part_out, part_in, part_rev, part_cursor, has_cursor = part
         cells_before = len(output)
         if has_cursor and part_cursor is not None:
-            cursor_position = part_cursor + cells_before
+            cursor_position = min(part_cursor, max(0, len(part_out) - 1)) + cells_before
         output.extend(part_out)
         in_position.extend(position + start for position in part_in)
         out_position.extend(position + cells_before for position in part_rev)
 
     return "".join(output), in_position, out_position, cursor_position
+
+
+def join_across_boundaries(translate, tabled, typeform, parts):
+    """Takes out the indicators a passage should not repeat at a table change.
+
+    Done once every run has been translated, because the decision needs both
+    sides of the boundary. An emphasis is joined only where **both** runs
+    actually wrapped it: a table that can wrap a passage still marks a short
+    one word by word, and striking the opener off a neighbour that never
+    opened anything would leave a terminator closing nothing.
+    """
+
+    for index in range(len(parts) - 1):
+        boundary = tabled[index][1]
+        for bit in continuing_emphasis(typeform, boundary):
+            before_table, after_table = tabled[index][2], tabled[index + 1][2]
+            before_pair = wrapping_indicators(translate, before_table, bit)
+            after_pair = wrapping_indicators(translate, after_table, bit)
+            if not before_pair or not after_pair:
+                continue
+            opener_before, terminator_before = before_pair
+            opener_after, _terminator_after = after_pair
+            if not terminator_before or not opener_after:
+                continue
+            # Both runs must have used the wrapping regime, which is visible
+            # in the output: the opener is there or it is not.
+            if opener_before and opener_before not in parts[index][0]:
+                continue
+            if opener_after not in parts[index + 1][0]:
+                continue
+
+            at = parts[index][0].rfind(terminator_before)
+            if at >= 0:
+                parts[index][0], parts[index][1], parts[index][2] = remove_cells(
+                    parts[index][0], parts[index][1], parts[index][2],
+                    at, len(terminator_before),
+                )
+            at = parts[index + 1][0].find(opener_after)
+            if at >= 0:
+                parts[index + 1][0], parts[index + 1][1], parts[index + 1][2] = (
+                    remove_cells(
+                        parts[index + 1][0], parts[index + 1][1], parts[index + 1][2],
+                        at, len(opener_after),
+                    )
+                )
 
 
 class _LouisProxy:
@@ -261,6 +444,7 @@ class MixedBraille:
         statistical=None,
         line_language=None,
         default_language=None,
+        join_emphasis=None,
     ):
         """
         Args:
@@ -292,6 +476,7 @@ class MixedBraille:
         self._statistical = statistical
         self._line_language = line_language or (lambda _text: None)
         self._default_language = default_language or (lambda: None)
+        self._join_emphasis = join_emphasis or (lambda: True)
         self._installed = False
         self._real_louis = None
         self._original_translate = None
@@ -511,6 +696,7 @@ class MixedBraille:
                 mode,
                 comp_flag,
                 extra_tables=list(table_list[1:]),
+                join_emphasis=bool(self._join_emphasis()),
             )
             self.translations += 1
             distinct = {table for _s, _e, table in tabled}

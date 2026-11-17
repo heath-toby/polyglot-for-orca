@@ -565,6 +565,153 @@ if os.path.exists(f"{TABLES}/IPA.utb"):
           translate_segments(louis.translate, ipa_split, MIXED, None, 0, 0,
                              getattr(louis, "compbrlAtCursor", 0))[0])
 
+# --- Joining an emphasis passage across a change of table ---------------------
+# A bold passage running from English into Russian should open once, in the
+# table it starts in, and close once, in the table it ends in. Translated run
+# by run, liblouis closes it at the end of one and opens it again at the start
+# of the next, because each call is a line to itself.
+
+from polyglot.mixed_braille import (  # noqa: E402
+    EMPHASIS_BITS,
+    continuing_emphasis,
+    join_across_boundaries,
+    remove_cells,
+    wrapping_indicators,
+)
+
+
+def bolded(text, first, last):
+    typeform = [0] * len(text)
+    for index in range(first, last):
+        typeform[index] = BOLD
+    return typeform
+
+
+def run_with(text, split, typeform, join=True):
+    return translate_segments(
+        louis.translate, split, text, list(typeform), 0, 0,
+        getattr(louis, "compbrlAtCursor", 0), join_emphasis=join,
+    )
+
+
+# The indicators are found by asking the table, not by knowing anything.
+check("UEB wraps a bold passage", wrapping_indicators(louis.translate, EN, BOLD),
+      ("\u2818\u2836", "\u2818\u2804"))
+check("the Russian table wraps with the same mark either side",
+      wrapping_indicators(louis.translate, RU, BOLD)[0],
+      wrapping_indicators(louis.translate, RU, BOLD)[1])
+check("a table with no such class has no pair",
+      wrapping_indicators(louis.translate, f"{TABLES}/unicode-braille.utb", BOLD),
+      None)
+check("the answer is remembered rather than probed again",
+      wrapping_indicators(louis.translate, EN, BOLD)
+      is wrapping_indicators(louis.translate, EN, BOLD), True)
+
+check("an emphasis set either side of a boundary is continuing",
+      continuing_emphasis([BOLD, BOLD, BOLD], 1), (BOLD,))
+check("an emphasis ending at the boundary is not",
+      continuing_emphasis([BOLD, 0, 0], 1), ())
+check("an emphasis starting at the boundary is not",
+      continuing_emphasis([0, BOLD, BOLD], 1), ())
+check("two emphases can continue at once",
+      sorted(continuing_emphasis([BOLD | ITALIC] * 3, 1)), sorted((ITALIC, BOLD)))
+check("no typeform means nothing continues", continuing_emphasis(None, 1), ())
+check("a boundary at the start continues nothing",
+      continuing_emphasis([BOLD, BOLD], 0), ())
+
+# Three bold words in UEB is a passage, and the join then applies.
+PASSAGE = "the word is really привет here"
+PSPLIT = [(0, 19, EN), (19, 26, RU), (26, 30, EN)]
+typeform = bolded(PASSAGE, 0, 25)
+separate = run_with(PASSAGE, PSPLIT, typeform, join=False)[0]
+joined_out, joined_in, joined_rev, _cursor = run_with(PASSAGE, PSPLIT, typeform)
+
+opener_en, terminator_en = wrapping_indicators(louis.translate, EN, BOLD)
+opener_ru, terminator_ru = wrapping_indicators(louis.translate, RU, BOLD)
+
+# Left alone, the English run closes the passage and the Russian run opens
+# one of its own. In the Russian table the opening and closing mark are the
+# same character, so it appears twice there before joining and once after.
+check("left alone, the English run closes the passage",
+      terminator_en in separate, True)
+check("left alone, the Russian run opens and closes its own",
+      separate.count(opener_ru), 2)
+check("joined, it opens in the English table", joined_out.startswith(opener_en), True)
+check("joined, the English terminator is gone",
+      terminator_en in joined_out, False)
+check("joined, the Russian opener is gone too",
+      joined_out.count(opener_ru), 1)
+check("joined, it closes in the Russian table",
+      joined_out.index(terminator_ru) > joined_out.index(opener_en), True)
+check("joining makes the line shorter, not longer",
+      len(joined_out) < len(separate), True)
+
+# The maps must survive cells being taken out: this is where a wrong index
+# would show up as routing landing on the wrong character.
+check("one map entry per cell after joining", len(joined_in), len(joined_out))
+check("one map entry per character after joining", len(joined_rev), len(PASSAGE))
+check("every in_position is inside the text after joining",
+      [p for p in joined_in if not 0 <= p < len(PASSAGE)], [])
+check("out_position never steps backwards after joining",
+      all(b >= a for a, b in zip(joined_rev, joined_rev[1:])), True)
+check("out_position stays within the cells after joining",
+      [p for p in joined_rev if not 0 <= p <= len(joined_out)], [])
+wrong = []
+for cell in range(len(joined_out)):
+    offset = joined_in[cell]
+    for start, end, _table in PSPLIT:
+        if start <= offset < end:
+            break
+    else:
+        wrong.append((cell, offset))
+check("every cell still maps into one of the runs after joining", wrong, [])
+
+# Two bold words in UEB is the word regime: there is no passage to carry, and
+# striking the Russian opener would leave a terminator closing nothing.
+WORDS = "the word is привет here"
+WSPLIT = [(0, 12, EN), (12, 19, RU), (19, 23, EN)]
+word_typeform = bolded(WORDS, 4, 18)
+check("the word regime is left exactly as it was",
+      run_with(WORDS, WSPLIT, word_typeform)[0],
+      run_with(WORDS, WSPLIT, word_typeform, join=False)[0])
+
+# Emphasis that stops at the boundary is not continuing, so nothing is joined.
+stops = bolded(PASSAGE, 0, 19)
+check("an emphasis that ends at the boundary is untouched",
+      run_with(PASSAGE, PSPLIT, stops)[0],
+      run_with(PASSAGE, PSPLIT, stops, join=False)[0])
+
+# An unemphasised line must be identical either way.
+check("a line with no emphasis is identical with the join on or off",
+      run_with(PASSAGE, PSPLIT, [0] * len(PASSAGE))[0],
+      run_with(PASSAGE, PSPLIT, [0] * len(PASSAGE), join=False)[0])
+
+# Italic and underline go the same way as bold.
+for label, bit in (("italic", ITALIC), ("underline", UNDERLINE)):
+    tf = [0] * len(PASSAGE)
+    for index in range(0, 25):
+        tf[index] = bit
+    with_join = run_with(PASSAGE, PSPLIT, tf)[0]
+    without = run_with(PASSAGE, PSPLIT, tf, join=False)[0]
+    pair_en = wrapping_indicators(louis.translate, EN, bit)
+    if pair_en and pair_en[1]:
+        check(f"a {label} passage is joined too", len(with_join) < len(without), True)
+
+# remove_cells on its own.
+check("removing cells shortens the output",
+      remove_cells("abcdef", [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], 2, 2)[0], "abef")
+check("removing cells drops their map entries",
+      remove_cells("abcdef", [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], 2, 2)[1],
+      [0, 1, 4, 5])
+check("removing cells moves later text offsets back",
+      remove_cells("abcdef", [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], 2, 2)[2],
+      [0, 1, 2, 2, 2, 3])
+check("removing nothing changes nothing",
+      remove_cells("abc", [0, 1, 2], [0, 1, 2], 1, 0), ("abc", [0, 1, 2], [0, 1, 2]))
+check("a removal past the end is refused",
+      remove_cells("abc", [0, 1, 2], [0, 1, 2], 2, 5), ("abc", [0, 1, 2], [0, 1, 2]))
+
+
 # --- Dots 7 and 8, spread through out_position --------------------------------
 # For attributes with no emphasis class, Orca builds a mask per character and
 # spreads it across the cells that character produced, using out_position. The

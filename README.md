@@ -423,6 +423,31 @@ Orca's own spreading loop against the joined maps and check that marking a
 Russian word marks only cells belonging to the Russian run, and that marks
 either side of a run boundary both survive.
 
+**An emphasis passage that crosses a change of table opens in the first table
+and closes in the last.** Translated run by run, liblouis closes the passage at
+the end of one run and opens it again at the start of the next, because each
+call is a line to itself and knows nothing of its neighbours. So a bold phrase
+running from English into Russian came out opened and closed twice. It is now
+joined: for "the word is really **привет** here" with the whole phrase bold,
+
+    ⠘⠶⠮⠀⠘⠺⠀⠊⠎⠀⠗⠂⠇⠇⠽⠀⠏⠗⠊⠺⠑⠞⠻⠀⠐⠓
+
+opens with UEB's `⠘⠶` and closes with the Russian table's `⠻`, with nothing in
+between. Switch it off with **braille-join-emphasis** if you would rather each
+run marked its own text.
+
+The indicators are found by asking each table rather than by knowing anything
+about it: a probe is translated plain and emphasised, and if the plain output
+appears whole inside the emphasised one, whatever sits either side is the pair.
+That holds for every wrapping table and fails cleanly for the rest.
+
+**It only joins where both runs actually wrapped the passage.** A table that
+can wrap still marks a short emphasis word by word -- UEB marks two bold words
+with an indicator before each rather than opening a passage -- and striking the
+opener off a neighbour that never opened anything would leave a terminator
+closing nothing. So two bold English words followed by bold Russian are left
+exactly as they were, and each code marks its own text.
+
 One quirk of Orca's, worth knowing and not caused by this: the mask for
 character *i* is spread from `out_position[i]` up to `out_position[i+1]`, which
 handles one character becoming several cells but not several becoming one. In a
