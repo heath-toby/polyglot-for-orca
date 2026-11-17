@@ -396,10 +396,47 @@ such as `/usr/bin/gh` came back marked German and was shown in a German table.
 the only path on which Orca translates anything. With it off, mixed braille is
 inert and says so in the log.
 
-Known limits: emphasis typeform is still computed with the region's default
-table, so emphasis signs inside a non-default run come from the wrong table's
-rules; and a line longer than 2000 characters is shown in one table rather than
-segmented.
+#### Formatting marks
+
+Both ways Orca marks formatting survive being split across tables, and
+emphasis comes out better than it could with one table.
+
+**Emphasis signs** -- bold, italic and underline -- are a liblouis typeform,
+and each run is translated with its own table's signs. Bold Russian is marked
+the Russian way (`⠻` either side); bold English gets UEB's bold passage
+indicators (`⠘⠶` ... `⠘⠄`). With one table for the line, one of those two had
+to be wrong.
+
+This works because Orca computes the typeform once, with the region's own
+table, and the bit for an emphasis class is a **liblouis constant** rather than
+something each table picks: bold is always 4, italic 1, underline 2, or 0 where
+the table has no such class. Checked across all 265 tables shipped here, and
+asserted in the tests so that if liblouis ever stops being true, a test fails
+rather than the braille going quietly wrong. A run whose table has no emphasis
+classes at all -- IPA, for instance -- simply ignores the typeform; it does not
+error and does not mark anything.
+
+**Dots 7 and 8**, used for the attributes with no emphasis class (size,
+paragraph style, selection), are spread from the per-character mask across the
+cells each character produced, using the same `out_position` map. The tests run
+Orca's own spreading loop against the joined maps and check that marking a
+Russian word marks only cells belonging to the Russian run, and that marks
+either side of a run boundary both survive.
+
+One quirk of Orca's, worth knowing and not caused by this: the mask for
+character *i* is spread from `out_position[i]` up to `out_position[i+1]`, which
+handles one character becoming several cells but not several becoming one. In a
+contraction every character but the last has an empty span and the last owns
+them all, so marking only the "t" of "the" marks nothing. It never shows,
+because a real attribute run covers whole words.
+
+The one case that does not work: if your **default** contraction table has no
+emphasis classes, Orca produces no typeform at all and no run gets emphasis,
+even one whose own table supports it. Choose a default that has them --
+`en-ueb-g2.ctb` does.
+
+Other limit: a line longer than 2000 characters is shown in one table rather
+than segmented.
 
 #### Seeing what it did
 

@@ -488,6 +488,168 @@ MixedBraille(
 ).tables_for("hello привет", EN)
 check("it is not asked at all about a line script could place", asked, [])
 
+# --- Formatting marks --------------------------------------------------------
+# Orca shows formatting two ways, and both have to survive being split across
+# tables. Emphasis classes the table knows (bold, italic, underline) become a
+# liblouis typeform; everything else the user asked for (size, paragraph
+# style, selection) becomes dots 7 and 8 in the attribute mask.
+
+BOLD, ITALIC, UNDERLINE = 4, 1, 2
+
+# **The assumption that makes this work at all.** Orca computes the typeform
+# once, with the region's own table, and hands the same numbers to every run.
+# That is only safe because the bit for an emphasis class is a liblouis
+# constant rather than something a table chooses: the table either has the
+# class, and gets the standard bit, or lacks it and gets 0. Asserted across a
+# spread of tables so that if liblouis ever stops being true, this fails
+# instead of the braille going quietly wrong.
+SPREAD = [
+    EN, RU, DE,
+    f"{TABLES}/en-gb-g1.utb", f"{TABLES}/en-us-g2.ctb",
+    f"{TABLES}/fr-bfu-g2.ctb", f"{TABLES}/nl-NL-g0.utb",
+    f"{TABLES}/ru-comp8.utb", f"{TABLES}/IPA.utb",
+    f"{TABLES}/unicode-braille.utb", f"{TABLES}/en-ueb-g1.ctb",
+]
+odd = []
+for table in SPREAD:
+    if not os.path.exists(table):
+        continue
+    for emphasis_class, standard in (("bold", BOLD), ("italic", ITALIC),
+                                     ("underline", UNDERLINE)):
+        try:
+            value = louis.getTypeformForEmphClass([table], emphasis_class)
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        if value not in (0, standard):
+            odd.append((os.path.basename(table), emphasis_class, value))
+check("an emphasis class gets the standard bit or none, in every table", odd, [])
+
+# Each run marks emphasis in its own script's convention, which is the part
+# that could not happen at all with one table for the line.
+typeform = [0] * len(MIXED)
+for index in range(12, 19):          # the Russian run
+    typeform[index] = BOLD
+russian_bold = joined(MIXED, split)[0], translate_segments(
+    louis.translate, split, MIXED, typeform, 0, 0,
+    getattr(louis, "compbrlAtCursor", 0))[0]
+check("bold on the Russian run changes the line", russian_bold[0] != russian_bold[1], True)
+check("and marks it with the Russian table's own emphasis sign",
+      louis.translate([UNICODE_DIS, RU], MIXED[12:19],
+                      typeform=[BOLD] * 7)[0] in russian_bold[1], True)
+
+typeform = [0] * len(MIXED)
+for index in range(0, 11):           # the English run
+    typeform[index] = BOLD
+english_bold = translate_segments(
+    louis.translate, split, MIXED, typeform, 0, 0,
+    getattr(louis, "compbrlAtCursor", 0))[0]
+check("bold on the English run marks it in UEB instead",
+      english_bold != russian_bold[1], True)
+check("an unemphasised line is unchanged by an all-zero typeform",
+      translate_segments(louis.translate, split, MIXED, [0] * len(MIXED), 0, 0,
+                         getattr(louis, "compbrlAtCursor", 0))[0],
+      joined(MIXED, split)[0])
+
+# A run whose table has no emphasis class must ignore the typeform rather than
+# fail or produce something else: the line still has to render.
+ipa_split = [(0, 12, EN), (12, 19, f"{TABLES}/IPA.utb"), (19, 23, EN)]
+if os.path.exists(f"{TABLES}/IPA.utb"):
+    # Bold on the IPA run only, so the English runs are not what is being
+    # compared: they would quite rightly change.
+    bold_ipa = [0] * len(MIXED)
+    for index in range(12, 19):
+        bold_ipa[index] = BOLD
+    check("a table without emphasis classes ignores the typeform",
+          translate_segments(louis.translate, ipa_split, MIXED, bold_ipa, 0, 0,
+                             getattr(louis, "compbrlAtCursor", 0))[0],
+          translate_segments(louis.translate, ipa_split, MIXED, None, 0, 0,
+                             getattr(louis, "compbrlAtCursor", 0))[0])
+
+# --- Dots 7 and 8, spread through out_position --------------------------------
+# For attributes with no emphasis class, Orca builds a mask per character and
+# spreads it across the cells that character produced, using out_position. The
+# loop below is Orca's own (braille.py, get_attribute_mask); running it against
+# the joined maps is what proves the mask still lands on the right cells when
+# the line changed table part-way along.
+
+_output, _in_pos, out_pos, _c = joined(MIXED, split)
+
+
+def spread(region_mask, out_position, cell_count):
+    """Orca's own spreading loop, so the maps are tested against the real one."""
+
+    mask = [0] * cell_count
+    out_len = len(out_position)
+    for index, value in enumerate(region_mask):
+        if not value or index >= out_len:
+            continue
+        start = max(out_position[index], 0)
+        end = out_position[index + 1] if index + 1 < out_len else cell_count
+        for cell in range(start, min(end, cell_count)):
+            mask[cell] |= value
+    return mask
+
+
+DOTS78 = 0xC0
+per_char = [0] * len(MIXED)
+for index in range(12, 18):          # привет, without its trailing space
+    per_char[index] = DOTS78
+mask = spread(per_char, out_pos, len(_output))
+
+check("the mask is one entry per cell", len(mask), len(_output))
+marked = [cell for cell, value in enumerate(mask) if value]
+check("marking the Russian word marks some cells", bool(marked), True)
+# Every marked cell must map back into the Russian run, and no cell outside it
+# may be marked -- a mask landing one cell out is how underlining drifts.
+check("every marked cell belongs to the Russian run",
+      [cell for cell in marked if not 12 <= _in_pos[cell] < 19], [])
+check("no cell of the English runs is marked",
+      [cell for cell, value in enumerate(mask)
+       if value and not 12 <= _in_pos[cell] < 19], [])
+check("the marked cells are contiguous",
+      marked == list(range(marked[0], marked[-1] + 1)), True)
+
+# Mark a whole word in each run, which is what a real attribute run covers,
+# and check the marks land in both.
+per_char = [0] * len(MIXED)
+for index in list(range(0, 3)) + list(range(12, 18)) + list(range(19, 23)):
+    per_char[index] = DOTS78
+mask = spread(per_char, out_pos, len(_output))
+runs_marked = {("ru" if 12 <= _in_pos[cell] < 19 else "en")
+               for cell, value in enumerate(mask) if value}
+check("marks in both runs are kept, either side of the boundary",
+      sorted(runs_marked), ["en", "ru"])
+
+# **A quirk of Orca's own, recorded so it is not rediscovered as a bug here.**
+# The mask for character i is spread from out_position[i] to out_position[i+1],
+# which handles one character becoming several cells. It does not handle
+# several characters becoming one cell: in a contraction every character but
+# the last has an empty span, and the last one owns the lot. "the" is one cell,
+# so marking only its 't' marks nothing at all. This is true with or without
+# mixed tables -- it is how Orca spreads the mask -- and it does not matter in
+# practice because a real attribute run covers whole words.
+single = [0] * len(MIXED)
+single[0] = DOTS78              # the 't' of a three-character contraction
+check("marking one character of a contraction marks no cells",
+      any(spread(single, out_pos, len(_output))), False)
+last = [0] * len(MIXED)
+last[2] = DOTS78                # the 'e', which owns the contraction's cell
+check("marking the last character of a contraction marks its cell",
+      spread(last, out_pos, len(_output))[0], DOTS78)
+# The Russian run is uncontracted, so there each character owns its own cell.
+one_russian = [0] * len(MIXED)
+one_russian[13] = DOTS78
+check("in an uncontracted run one character marks exactly one cell",
+      sum(1 for value in spread(one_russian, out_pos, len(_output)) if value), 1)
+
+# The spreading loop reads out_position[i + 1] as the end of character i's
+# cells, so a run boundary must not make it go backwards.
+check("out_position never steps backwards across a run boundary",
+      all(b >= a for a, b in zip(out_pos, out_pos[1:])), True)
+check("the last character's cells reach the end of the line",
+      out_pos[-1] <= len(_output), True)
+
+
 # --- Saying so when it can do nothing ----------------------------------------
 # Orca only translates a region when contracted braille is on, so with it off
 # this is inert. The symptom is nothing happening, which is the hardest kind

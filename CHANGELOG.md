@@ -1,5 +1,50 @@
 # Changelog
 
+## 2.11.1
+
+**Formatting marks work across mixed tables, and 2.11.0 was wrong to say they
+did not.**
+
+2.11.0 listed emphasis as a known limitation, on the reasoning that Orca
+computes the typeform once with the region's own table and hands the same
+numbers to every run. Measured rather than assumed, that reasoning is wrong:
+the bit for an emphasis class is a **liblouis constant**, not something a table
+chooses. Bold is always 4, italic 1, underline 2 -- or 0 where the table has no
+such class. Checked across all 265 tables installed here; no table returns
+anything else.
+
+So a typeform computed with one table is already correct for every other, and
+emphasis comes out *better* than one table could manage: each run is marked in
+its own script's convention. Bold Russian gets the Russian table's signs
+(`⠻` either side), bold English gets UEB's bold passage indicators
+(`⠘⠶` ... `⠘⠄`). A run whose table has no emphasis classes ignores the
+typeform without erroring.
+
+Dots 7 and 8 -- used for size, paragraph style and selection, which have no
+emphasis class -- are spread across the cells each character produced using the
+same `out_position` map, so they were never at risk either. The tests now run
+Orca's own spreading loop against the joined maps.
+
+**No change to the Orca braille-formatting patch was needed.**
+
+### Added
+
+- 17 test rows for formatting. The important one asserts the liblouis constant
+  across a spread of tables, so if that ever changes a test fails instead of
+  the braille going quietly wrong.
+- A row recording a quirk of Orca's own: the mask for character *i* spreads
+  from `out_position[i]` to `out_position[i+1]`, which handles one character
+  becoming several cells but not several becoming one. In a contraction the
+  last character owns the span, so marking only the "t" of "the" marks nothing.
+  True with or without mixed tables, and invisible in practice because a real
+  attribute run covers whole words.
+
+### Known
+
+- If the **default** contraction table has no emphasis classes, Orca produces
+  no typeform at all and no run gets emphasis, even one whose table supports
+  it. `en-ueb-g2.ctb` has them.
+
 ## 2.11.0
 
 **Each language on a braille line now shows in its own table.**
