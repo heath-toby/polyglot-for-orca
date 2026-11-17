@@ -24,6 +24,7 @@ Needs Polyglot's debug logging on:
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import sys
@@ -56,8 +57,11 @@ def parse(line):
         if run is None:
             return None
         try:
-            text = eval(run.group("text"), {"__builtins__": {}}, {})  # noqa: S307
-        except Exception:  # pylint: disable=broad-exception-caught
+            # literal_eval, not eval: this is a line out of a log file, and a
+            # log file is not somewhere to take code from, however narrow the
+            # namespace handed to it.
+            text = ast.literal_eval(run.group("text"))
+        except (ValueError, SyntaxError):
             return None
         if not isinstance(text, str):
             return None

@@ -27,10 +27,10 @@ import sys
 sys.path.insert(0, os.path.expanduser("~/.local/share/orca/extensions"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import louis  # noqa: E402
+import louis
 
-from polyglot.language_detector import _get_script  # noqa: E402
-from polyglot.mixed_braille import (  # noqa: E402
+from polyglot.language_detector import _get_script
+from polyglot.mixed_braille import (
     UNICODE_DIS,
     MixedBraille,
     cells_of,
@@ -95,7 +95,7 @@ def report(text: str) -> None:
     tabled = mixer.tables_for(text, DEFAULT_TABLE)
 
     print(f"  {text!r}")
-    print(f"    runs: " + " | ".join(
+    print("    runs: " + " | ".join(
         f"{text[s:e]!r} -> {t.rsplit('/', 1)[-1]}" for s, e, t in tabled
     ))
     print()
@@ -106,7 +106,7 @@ def report(text: str) -> None:
     language = dominant_language(text)
     table = LANG_TABLES.get(language) or DEFAULT_TABLE
     best = louis.translate([UNICODE_DIS, table], text)[0]
-    show(f"dominant", best)
+    show("dominant", best)
     print(f"{'':14}  (chose {table.rsplit('/', 1)[-1]}, the table for "
           f"{language or 'the line default'}, which most of the line is in)")
 

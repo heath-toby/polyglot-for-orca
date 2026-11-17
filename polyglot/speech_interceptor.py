@@ -1928,11 +1928,15 @@ def _set_contraction_table(table_path):
     """
     global _current_contraction_table
 
-    if _mixed_braille is not None and _mixed_braille.installed:
+    if _mixed_braille is not None and _mixed_braille.active:
         # Mixed braille picks a table per language run, so a table set for
         # the whole line would only fight it: the run that matched no
         # language falls back to whatever this left behind, which would then
         # wander with the last line read.
+        #
+        # `active`, not `installed`: with Orca's contracted braille off there
+        # is no translation for mixed braille to hook, so it decides nothing
+        # and this must carry on as before.
         return
 
     if table_path == _current_contraction_table:
@@ -2009,11 +2013,15 @@ def _set_brltty_text_table(lang_code):
     """
     global _current_brltty_text_table, _brltty_display_seen
 
-    if _mixed_braille is not None and _mixed_braille.installed:
+    if _mixed_braille is not None and _mixed_braille.active:
         # Nothing to set. Every cell now leaves Orca as a U+2800 character,
         # which BRLTTY renders verbatim whatever its text table says, so the
         # table is no longer ours to change -- and leaving it alone leaves
         # the display's input table alone with it.
+        #
+        # `active`, not `installed`: with contracted braille off nothing is
+        # translated client-side, so BRLTTY is doing the character-to-dot
+        # mapping after all and its table still has to follow the language.
         return
 
     present = _braille_display_present()

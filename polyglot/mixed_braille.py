@@ -204,24 +204,35 @@ def wrapping_indicators(translate, table, bit):
     return result
 
 
-def remove_cells(output, in_position, out_position, at, count):
-    """Removes `count` cells at `at`, keeping both maps consistent.
+def shift_cell(cell, at, count):
+    """Where a cell index lands once `count` cells at `at` are removed."""
+
+    if cell >= at + count:
+        return cell - count
+    return min(cell, at)
+
+
+def remove_cells(output, in_position, out_position, at, count, cursor=None):
+    """Removes `count` cells at `at`, keeping both maps and the cursor right.
 
     The cells removed are an emphasis indicator, so the map entries that
     pointed at them are dropped rather than redirected, and every text offset
-    that pointed past them moves back. A text offset pointing *into* them is
-    clamped to where they were, which is the first cell of what follows.
+    that pointed past them moves back. A text offset pointing *into* them
+    lands where they were, which is the first cell of what follows.
+
+    The cursor moves by the same rule. It has to: it was worked out before
+    any cell was taken away, so leaving it be would put it a cell or two to
+    the right of the character it belongs to -- and the cursor is how a
+    braille reader knows where they are.
     """
 
     if count <= 0 or at < 0 or at + count > len(output):
-        return output, in_position, out_position
+        return output, in_position, out_position, cursor
     kept_output = output[:at] + output[at + count:]
     kept_in = in_position[:at] + in_position[at + count:]
-    kept_out = [
-        cell - count if cell >= at + count else (at if cell > at else cell)
-        for cell in out_position
-    ]
-    return kept_output, kept_in, kept_out
+    kept_out = [shift_cell(cell, at, count) for cell in out_position]
+    kept_cursor = None if cursor is None else shift_cell(cursor, at, count)
+    return kept_output, kept_in, kept_out, kept_cursor
 
 
 def continuing_emphasis(typeform, boundary):
@@ -359,7 +370,11 @@ def translate_segments(
         part_out, part_in, part_rev, part_cursor, has_cursor = part
         cells_before = len(output)
         if has_cursor and part_cursor is not None:
-            cursor_position = min(part_cursor, max(0, len(part_out) - 1)) + cells_before
+            # Clamped to len(part_out), not len - 1: liblouis may legitimately
+            # put the cursor one past the last cell, and Orca's own
+            # _contract_line allows exactly that. Clamping shorter moved the
+            # cursor a cell left whenever it sat at the end of a run.
+            cursor_position = min(part_cursor, len(part_out)) + cells_before
         output.extend(part_out)
         in_position.extend(position + start for position in part_in)
         out_position.extend(position + cells_before for position in part_rev)
@@ -387,28 +402,32 @@ def join_across_boundaries(translate, tabled, typeform, parts):
                 continue
             opener_before, terminator_before = before_pair
             opener_after, _terminator_after = after_pair
-            if not terminator_before or not opener_after:
+            # Every piece has to be there. A table with a terminator but no
+            # opener has nothing to carry across, so taking its terminator
+            # away would lose the only mark it made.
+            if not (opener_before and terminator_before and opener_after):
                 continue
-            # Both runs must have used the wrapping regime, which is visible
-            # in the output: the opener is there or it is not.
-            if opener_before and opener_before not in parts[index][0]:
+            # And both runs must have *used* the wrapping regime, which is
+            # visible in the output: the opener is there or it is not.
+            if opener_before not in parts[index][0]:
                 continue
             if opener_after not in parts[index + 1][0]:
                 continue
 
             at = parts[index][0].rfind(terminator_before)
             if at >= 0:
-                parts[index][0], parts[index][1], parts[index][2] = remove_cells(
+                (parts[index][0], parts[index][1],
+                 parts[index][2], parts[index][3]) = remove_cells(
                     parts[index][0], parts[index][1], parts[index][2],
-                    at, len(terminator_before),
+                    at, len(terminator_before), parts[index][3],
                 )
             at = parts[index + 1][0].find(opener_after)
             if at >= 0:
-                parts[index + 1][0], parts[index + 1][1], parts[index + 1][2] = (
-                    remove_cells(
-                        parts[index + 1][0], parts[index + 1][1], parts[index + 1][2],
-                        at, len(opener_after),
-                    )
+                (parts[index + 1][0], parts[index + 1][1],
+                 parts[index + 1][2], parts[index + 1][3]) = remove_cells(
+                    parts[index + 1][0], parts[index + 1][1],
+                    parts[index + 1][2], at, len(opener_after),
+                    parts[index + 1][3],
                 )
 
 
@@ -554,6 +573,25 @@ class MixedBraille:
         """Returns whether the proxy is in place."""
 
         return self._installed
+
+    @property
+    def active(self) -> bool:
+        """Returns whether it is actually deciding any tables.
+
+        Installed is not the same as working. Orca only translates a region
+        when contracted braille is on, so with it off the proxy is in place
+        and never consulted. Anything that stands down on this add-on's
+        behalf -- the BRLTTY table switching it replaces -- has to ask this
+        rather than `installed`, or a reader with contracted braille off
+        would lose the old behaviour and gain nothing in its place.
+
+        Read live rather than cached, so turning contracted braille on or off
+        in Orca's preferences takes effect without a restart.
+        """
+
+        if not self._installed or self._braille is None:
+            return False
+        return bool(getattr(self._braille._STATE, "enable_contracted_braille", True))
 
     def clear_cache(self) -> None:
         """Forgets remembered segmentations, after a settings change."""

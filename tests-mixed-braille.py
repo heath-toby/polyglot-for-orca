@@ -22,10 +22,10 @@ import sys
 
 sys.path.insert(0, os.path.expanduser("~/.local/share/orca/extensions"))
 
-import louis  # noqa: E402
+import louis
 
-from polyglot.mixed_braille import (  # noqa: E402
-    BRAILLE_ROW,
+from polyglot.language_detector import _get_script
+from polyglot.mixed_braille import (
     MAX_DETECT_LENGTH,
     UNICODE_DIS,
     MixedBraille,
@@ -37,7 +37,6 @@ from polyglot.mixed_braille import (  # noqa: E402
     segment_at,
     translate_segments,
 )
-from polyglot.language_detector import _get_script  # noqa: E402
 
 TABLES = "/usr/share/liblouis/tables"
 EN = f"{TABLES}/en-ueb-g2.ctb"
@@ -518,7 +517,9 @@ for table in SPREAD:
                                      ("underline", UNDERLINE)):
         try:
             value = louis.getTypeformForEmphClass([table], emphasis_class)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except (RuntimeError, AttributeError) as error:
+            # A table that will not compile is not what this row is about.
+            print(f"  (skipped {os.path.basename(table)} {emphasis_class}: {error})")
             continue
         if value not in (0, standard):
             odd.append((os.path.basename(table), emphasis_class, value))
@@ -538,7 +539,7 @@ check("and marks it with the Russian table's own emphasis sign",
                       typeform=[BOLD] * 7)[0] in russian_bold[1], True)
 
 typeform = [0] * len(MIXED)
-for index in range(0, 11):           # the English run
+for index in range(11):           # the English run
     typeform[index] = BOLD
 english_bold = translate_segments(
     louis.translate, split, MIXED, typeform, 0, 0,
@@ -571,10 +572,8 @@ if os.path.exists(f"{TABLES}/IPA.utb"):
 # by run, liblouis closes it at the end of one and opens it again at the start
 # of the next, because each call is a line to itself.
 
-from polyglot.mixed_braille import (  # noqa: E402
-    EMPHASIS_BITS,
+from polyglot.mixed_braille import (
     continuing_emphasis,
-    join_across_boundaries,
     remove_cells,
     wrapping_indicators,
 )
@@ -689,7 +688,7 @@ check("a line with no emphasis is identical with the join on or off",
 # Italic and underline go the same way as bold.
 for label, bit in (("italic", ITALIC), ("underline", UNDERLINE)):
     tf = [0] * len(PASSAGE)
-    for index in range(0, 25):
+    for index in range(25):
         tf[index] = bit
     with_join = run_with(PASSAGE, PSPLIT, tf)[0]
     without = run_with(PASSAGE, PSPLIT, tf, join=False)[0]
@@ -697,19 +696,53 @@ for label, bit in (("italic", ITALIC), ("underline", UNDERLINE)):
     if pair_en and pair_en[1]:
         check(f"a {label} passage is joined too", len(with_join) < len(without), True)
 
-# remove_cells on its own.
+# remove_cells on its own. Taking cells out of the middle of a line is the
+# operation that would make routing, underlining or the cursor land a cell out,
+# so each of the three things it maintains gets a row.
+SIX = ("abcdef", [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
 check("removing cells shortens the output",
-      remove_cells("abcdef", [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], 2, 2)[0], "abef")
+      remove_cells(*SIX, 2, 2)[0], "abef")
 check("removing cells drops their map entries",
-      remove_cells("abcdef", [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], 2, 2)[1],
-      [0, 1, 4, 5])
+      remove_cells(*SIX, 2, 2)[1], [0, 1, 4, 5])
 check("removing cells moves later text offsets back",
-      remove_cells("abcdef", [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], 2, 2)[2],
-      [0, 1, 2, 2, 2, 3])
+      remove_cells(*SIX, 2, 2)[2], [0, 1, 2, 2, 2, 3])
 check("removing nothing changes nothing",
-      remove_cells("abc", [0, 1, 2], [0, 1, 2], 1, 0), ("abc", [0, 1, 2], [0, 1, 2]))
+      remove_cells("abc", [0, 1, 2], [0, 1, 2], 1, 0),
+      ("abc", [0, 1, 2], [0, 1, 2], None))
 check("a removal past the end is refused",
-      remove_cells("abc", [0, 1, 2], [0, 1, 2], 2, 5), ("abc", [0, 1, 2], [0, 1, 2]))
+      remove_cells("abc", [0, 1, 2], [0, 1, 2], 2, 5),
+      ("abc", [0, 1, 2], [0, 1, 2], None))
+
+# The cursor must move with the cells, or it ends up to the right of the
+# character it belongs to -- and the cursor is how a braille reader knows
+# where they are. This was wrong in the first cut of the join: it clamped the
+# cursor to one cell short of the run's end, moving it left whenever it sat at
+# the end of a run, whether or not anything had been removed.
+check("a cursor after the removal moves back", remove_cells(*SIX, 1, 2, 5)[3], 3)
+check("a cursor before the removal stays put", remove_cells(*SIX, 3, 2, 1)[3], 1)
+check("a cursor inside the removal lands where they were",
+      remove_cells(*SIX, 1, 3, 2)[3], 1)
+check("a cursor exactly at the removal stays put",
+      remove_cells(*SIX, 2, 2, 2)[3], 2)
+check("no cursor stays no cursor", remove_cells(*SIX, 1, 2, None)[3], None)
+check("a refused removal leaves the cursor alone",
+      remove_cells("abc", [0, 1, 2], [0, 1, 2], 2, 5, 2)[3], 2)
+
+# End to end: the cursor in a joined line must still be a real cell, and must
+# not have drifted past the character it is on.
+for offset in (0, 5, 20, 24, len(PASSAGE) - 1):
+    out_j, in_j, _rev_j, cur_j = translate_segments(
+        louis.translate, PSPLIT, PASSAGE, list(typeform), offset, 0,
+        getattr(louis, "compbrlAtCursor", 0),
+    )
+    check(f"a cursor at text {offset} is a cell of the joined line",
+          cur_j is not None and 0 <= cur_j <= len(out_j), True)
+
+# A table with a terminator but no opener has nothing to carry, so its
+# terminator must survive: it is the only mark it made.
+_wrap_probe = wrapping_indicators(louis.translate, EN, BOLD)
+check("the join needs an opener as well as a terminator",
+      bool(_wrap_probe and _wrap_probe[0] and _wrap_probe[1]), True)
 
 
 # --- Dots 7 and 8, spread through out_position --------------------------------
@@ -759,7 +792,7 @@ check("the marked cells are contiguous",
 # Mark a whole word in each run, which is what a real attribute run covers,
 # and check the marks land in both.
 per_char = [0] * len(MIXED)
-for index in list(range(0, 3)) + list(range(12, 18)) + list(range(19, 23)):
+for index in list(range(3)) + list(range(12, 18)) + list(range(19, 23)):
     per_char[index] = DOTS78
 mask = spread(per_char, out_pos, len(_output))
 runs_marked = {("ru" if 12 <= _in_pos[cell] < 19 else "en")
@@ -802,7 +835,7 @@ check("the last character's cells reach the end of the line",
 # this is inert. The symptom is nothing happening, which is the hardest kind
 # to diagnose, so install says so.
 
-from orca import braille as _orca_braille  # noqa: E402
+from orca import braille as _orca_braille
 
 _was = _orca_braille._STATE.enable_contracted_braille
 _said = []
@@ -813,7 +846,27 @@ try:
     check("it installs even with contracted braille off", _quiet.install(), True)
     check("and says that nothing will be translated",
           any("contracted braille is off" in message for message in _said), True)
+    check("but reports itself inactive, so nothing stands down for it",
+          _quiet.active, False)
     _quiet.uninstall()
+
+    # Installed is not the same as working, and the difference decides
+    # whether the BRLTTY table switching this replaces may stand down. With
+    # contracted braille off it must not: nothing is translated client-side,
+    # so BRLTTY is still doing the character-to-dot mapping and its table
+    # still has to follow the language.
+    check("with contracted braille off it is installed but not active",
+          (_quiet.installed, _quiet.active), (False, False))
+    _reinstalled = MixedBraille(LANG_TABLES.get, lambda: SCRIPT_MAP, _get_script)
+    _reinstalled.install()
+    check("installed with contracted braille off is not active",
+          (_reinstalled.installed, _reinstalled.active), (True, False))
+    _orca_braille._STATE.enable_contracted_braille = True
+    check("turning contracted braille on makes it active without reinstalling",
+          _reinstalled.active, True)
+    _reinstalled.uninstall()
+    check("uninstalled is neither installed nor active",
+          (_reinstalled.installed, _reinstalled.active), (False, False))
 
     _said.clear()
     _orca_braille._STATE.enable_contracted_braille = True

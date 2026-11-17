@@ -26,11 +26,11 @@ jobs:
       - name: install ruff
         run: python -m pip install --upgrade pip ruff
       - name: compile every .py (catches typos and broken syntax)
-        run: python -m compileall -q polyglot tests-language-matrix.py
+        run: python -m compileall -q polyglot tools tests-language-matrix.py tests-mixed-braille.py tests-brltty-worker.py
       - name: ruff check
         # Not --fail-on-warnings: ruff is advisory for us. We just want to
         # see the output.
-        run: ruff check polyglot tests-language-matrix.py || true
+        run: ruff check polyglot tools tests-language-matrix.py tests-mixed-braille.py tests-brltty-worker.py || true
 
   import-check:
     name: import against Orca master

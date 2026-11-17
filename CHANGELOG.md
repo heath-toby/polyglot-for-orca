@@ -1,5 +1,118 @@
 # Changelog
 
+## 3.0.0
+
+**Braille is no longer limited to one table at a line.** Each language run is
+shown in its own braille table, with an emphasis passage opening in the table
+it starts in and closing in the table it ends in. A major version because it
+changes where the character-to-dot mapping happens, and because it stops
+Polyglot touching BRLTTY at all.
+
+### Mixed-language braille
+
+An English sentence with a Russian phrase reads as English braille then
+Russian braille, on one line. Before, braille could only be in one table at a
+time, so Polyglot picked one per line: right for most of it and wrong for the
+rest. "the word is привет here" through an English table degraded the Russian
+to liblouis hex escapes -- 59 cells for 23 characters, which will not fit on a
+40-cell display. Per run it is 17 cells and reads properly.
+
+Orca contracts each region with a single `louis.translate` call returning the
+cells and two position maps. That call is wrapped, each run is translated with
+its own table, and the cells and both maps are rejoined with their offsets
+corrected. Routing keys, the cursor, attribute underlining and panning all
+read those maps, so the maps are where the risk is and where the tests point.
+The approach is taken from the NVDA add-on
+[BrailleLanguageSwitcher](https://github.com/heath-toby/brailleLanguageSwitcher),
+which wraps NVDA's equivalent call.
+
+### BRLTTY is no longer asked to change anything
+
+BRLAPI's own documentation says its text path is a one-to-one character table
+and that a client wanting contraction should do it itself and send dot
+patterns. So liblouis is asked for dots rather than letters, by prefixing
+`unicode.dis`, and BRLTTY renders the U+2800 block verbatim whatever table it
+has loaded. Two consequences, and the reason this is a major release:
+
+- **`brlapi.setParameter` is not called at all.** There were 40 table-switching
+  calls in the 2MB of log before this change and none after. That is the
+  synchronous round trip which once stopped Orca for 49 seconds with BRLTTY
+  running and no display attached -- gone, rather than worked around.
+- **The display's input table is left where you put it.** It was the same table
+  Polyglot had been changing underneath it.
+
+This applies only while mixed braille is actually deciding tables, which needs
+Orca's contracted braille to be on. With it off, nothing is translated client
+side, BRLTTY is doing the mapping after all, and the old table switching
+carries on exactly as before.
+
+### Emphasis across a change of table
+
+A bold passage running from English into Russian opens with UEB's `⠘⠶` and
+closes with the Russian table's `⠻`, instead of being opened and closed twice.
+The indicators are found by asking each table rather than by knowing anything
+about it, and the join happens only where both runs actually wrapped the
+passage -- UEB marks two bold words individually rather than opening a
+passage, and striking the opener off a neighbour that never opened anything
+would leave a terminator closing nothing. Switch it off with
+**braille-join-emphasis**.
+
+Dots 7 and 8, for the attributes with no emphasis class, are spread across the
+cells each character produced using the same map, so they come through
+unchanged. **The Orca braille-formatting patch needed no change.**
+
+### How a run's table is chosen
+
+1. **Script**, which is certain and needs no minimum length. One Cyrillic word
+   is Cyrillic however few words surround it -- which matters, because a
+   braille line is shorter than the statistical detector's eight-word floor.
+2. **The line's own detected language**, for a line script cannot place at all.
+   There is no German script, so a wholly German line takes the language
+   Polyglot detected for it, as the old per-line switching did.
+3. **The configured default** for the unplaced parts of a *mixed* line, not the
+   line's dominant language, or a Russian-heavy line would put its English
+   words in a Russian table.
+4. **The statistical detector** where languages share a script, believed only
+   for a run holding enough natural words. A KeePassXC notification ending in
+   `/usr/bin/gh` came back marked German and was shown in a German table within
+   a minute of live testing.
+
+### Settings
+
+- **braille-mixed-language**, on by default.
+- **braille-join-emphasis**, on by default.
+
+### Tools
+
+- `tools/braille-tables.py` -- a line translated three ways (one table, the
+  dominant language's, per run) as braille, dot numbers and BRLAPI bytes, so a
+  cell can be checked by hand against a table chart.
+- `tools/braille-trace.py --check` -- reads back the lines that actually
+  reached the display, re-translates them and compares. That is the one check
+  reading the display cannot perform: a wrong cell still feels like a cell.
+
+### Found in review
+
+- **The cursor did not follow cells being removed**, and was clamped a cell
+  short of a run's end whether or not anything had been removed -- so it moved
+  left whenever it sat at the end of a run. It now shifts by the same rule as
+  the position maps.
+- **A reader with contracted braille off would have lost table switching
+  altogether**: the guards keyed off "installed" rather than "actually
+  deciding tables", so the BRLTTY switching stood down for a feature that was
+  inert. There is now an `active` check, read live so toggling contracted
+  braille takes effect without a restart.
+- A table with a terminator but no opener had its terminator stripped, losing
+  the only mark it made. The join now requires both halves.
+- `tools/braille-trace.py` used `eval` to unquote a string out of the log. A
+  log file is not somewhere to take code from; it uses `ast.literal_eval`.
+- CI now compiles and lints `tools/` and the new test files, which it did not.
+
+### Testing
+
+156 rows for braille, 296 across the add-on. Verified on an APH Mantis Q40
+over `brltty.path`, and every line logged re-translates to the same cells.
+
 ## 2.12.0
 
 **An emphasis passage that crosses a change of table now opens in one table
