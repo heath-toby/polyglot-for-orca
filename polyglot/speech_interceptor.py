@@ -899,6 +899,80 @@ def _braille_table_for(lang_code):
     return _SENTINEL_BRAILLE_TABLES.get(lang_code)
 
 
+#: Beyond this many characters, the focused object's text is not fetched to
+#: give a braille line context. A whole document in one accessible is a
+#: large AT-SPI round trip, and the sentences either side of the line are
+#: all the context the detector can use anyway.
+_CONTEXT_MAX_CHARACTERS = 20000
+
+# (object text, the text we looked for, where it was found). One entry:
+# consecutive braille lines of one paragraph hit it, and anything else
+# misses and simply costs a fetch.
+_context_cache: tuple[str, str, int] | None = None
+
+
+def _nearest_occurrence(whole: str, line: str, caret: int):
+    """Where ``line`` sits in ``whole``, nearest to ``caret``, or None.
+
+    A line can occur more than once -- a column of repeated values, a
+    chorus, two identical cells -- and the caret says which copy is the one
+    on the display. Nearest rather than exact, because panning moves along
+    a line without moving the caret, so the offsets rarely coincide.
+    """
+    if not line or not whole:
+        return None
+    best = None
+    index = whole.find(line)
+    while index >= 0:
+        distance = abs(index - caret)
+        if best is None or distance < best[1]:
+            best = (index, distance)
+        index = whole.find(line, index + 1)
+    return None if best is None else best[0]
+
+
+def _line_in_context(line: str):
+    """``(whole text, where `line` starts in it)`` for the focused object,
+    or None.
+
+    A braille line is usually too short to identify statistically, but it
+    is a slice of something longer that is not. This fetches that longer
+    text so the detector can read the sentences around the line.
+
+    Returns None whenever the line cannot be placed -- no focus, not text,
+    too long, or the line is not in it (braille shows plenty that is not
+    the object's text: the window title, a status bar, flat review). The
+    caller then detects on the line alone, as before.
+    """
+    global _context_cache
+    if not line or not line.strip():
+        return None
+    try:
+        from orca import focus_manager
+        from orca.ax_object import AXObject
+        from orca.ax_text import AXText
+
+        obj = focus_manager.get_manager().get_locus_of_focus()
+        if obj is None or not AXObject.supports_text(obj):
+            return None
+        if _context_cache is not None and _context_cache[1] == line:
+            return _context_cache[0], _context_cache[2]
+        if AXText.get_character_count(obj) > _CONTEXT_MAX_CHARACTERS:
+            return None
+        whole = AXText.get_text(obj)
+        if not whole or len(whole) <= len(line):
+            return None
+        caret = AXText.get_caret_offset(obj) or 0
+        found = _nearest_occurrence(whole, line, caret)
+        if found is None:
+            return None
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        _debug(f"_line_in_context: {type(error).__name__}: {error}")
+        return None
+    _context_cache = (whole, line, found)
+    return whole, found
+
+
 def _statistical_runs(text):
     """Language runs from the mixed detector, for languages sharing a script.
 
@@ -923,6 +997,20 @@ def _statistical_runs(text):
     if _detector is None or _config is None or not _config.enable_mixed_language:
         return None
     runs = _detector.detect_mixed(text)
+    if not runs and _config.braille_line_context:
+        # Too short to call on its own. The line is a slice of a paragraph
+        # though, so detect the sentences around it and keep this slice's
+        # share of the answer. This is what makes a forty-cell line
+        # detectable at all: detect_mixed declines under eight words.
+        placed = _line_in_context(text)
+        if placed is not None:
+            whole, start = placed
+            runs = _detector.detect_mixed_in_context(
+                whole, start, start + len(text))
+            if runs:
+                _debug(f"_statistical_runs: {text!r} decided in context "
+                       f"({len(whole)} chars) -> "
+                       f"{[lang for _t, lang in runs]}")
     if not runs:
         return None
 

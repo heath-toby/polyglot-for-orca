@@ -26,11 +26,11 @@ jobs:
       - name: install ruff
         run: python -m pip install --upgrade pip ruff
       - name: compile every .py (catches typos and broken syntax)
-        run: python -m compileall -q polyglot tools tests-language-matrix.py tests-mixed-braille.py tests-brltty-worker.py
+        run: python -m compileall -q polyglot tools tests-language-matrix.py tests-mixed-braille.py tests-context-window.py tests-brltty-worker.py
       - name: ruff check
         # Not --fail-on-warnings: ruff is advisory for us. We just want to
         # see the output.
-        run: ruff check polyglot tools tests-language-matrix.py tests-mixed-braille.py tests-brltty-worker.py || true
+        run: ruff check polyglot tools tests-language-matrix.py tests-mixed-braille.py tests-context-window.py tests-brltty-worker.py || true
 
   import-check:
     name: import against Orca master
@@ -133,6 +133,16 @@ jobs:
                   failed.append((name, e))
           sys.exit(1 if failed else 0)
           PY
+
+      - name: context window and embedded floor
+        # The only suite that runs in CI. The others need liblouis tables
+        # and a braille display; this one needs nothing but lingua, which
+        # is already installed above, and it guards the two pieces of
+        # detection logic whose thresholds were measured rather than
+        # derived -- exactly the kind that drifts unnoticed.
+        run: |
+          export PYTHONPATH="$PWD:$PYTHONPATH"
+          python3 tests-context-window.py
 
       - name: signature compatibility check against patched Orca methods
         # The specific bug that burned us: Polyglot patches

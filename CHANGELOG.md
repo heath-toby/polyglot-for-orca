@@ -1,5 +1,62 @@
 # Changelog
 
+## 3.1.0
+
+Two ideas borrowed from [Dialingo](https://github.com/rashadnaqeeb/nvda-dialingo),
+an NVDA add-on by Rashad Naqeeb, and a licence.
+
+### A short braille line is now decided by the sentences around it
+
+Script detection carries most braille lines, but languages sharing a script
+need statistics, and statistics need words. A forty-cell line is a handful of
+words, and the mixed detector declines anything under eight -- so on a display
+it declined nearly everything and the line kept the default table.
+
+Now, when a line is too short to judge, Polyglot reads the focused object's
+text, widens the line to the sentences it cuts (at most 200 characters either
+way, stopping at a paragraph break), detects that, and keeps the line's share
+of the answer. A three-word German line in a German paragraph comes out in the
+German table.
+
+It never moves the voice -- the window is scored rather than detected, because
+`detect()` commits to what it finds and a braille redraw has no business
+changing which voice is speaking. And it gives up quietly: no focus, not a text
+object, text over 20,000 characters, or a line that is not in that text (the
+window title, a status bar, flat review) each fall back to judging the line
+alone. Turn it off with `braille_line_context`.
+
+### A fragment the default language surrounds must now be near certain
+
+A foreign fragment with default-language text either side of it is held to 0.98
+confidence rather than the ordinary switch threshold, judged between it and the
+default alone rather than spread across every enabled language.
+
+This fixes a fault found on the Mantis within a minute of switching mixed
+braille on: a KeePassXC notification ending in `/usr/bin/gh` had the path marked
+German and contracted in a German grade-1 table. The path scores 0.598 against
+English and now stays put; a real German clause scores above 0.99 and still
+switches. The figures are in the `EMBEDDED_FLOOR` docstring and each case is a
+test row.
+
+### Licensed, at last
+
+GPL-3.0-or-later, with the full text in `LICENSE`. There was no licence file
+before, only a line in the README saying the project was free software, which
+is a sentiment rather than something anyone can rely on.
+
+Version 3 rather than 2 because Polyglot imports Lingua, which is Apache-2.0,
+and Apache-2.0 cannot be combined with GPL-2.0 -- its patent-termination clause
+is an additional restriction that GPL-2.0 forbids. GPL-3.0 accommodates it.
+
+### Not taken
+
+Dialingo normalises text before detection -- straight apostrophes, hyphens as
+spaces -- because fastText splits on whitespace alone. Measured against Lingua
+on the single and the segmented path: identical confidences to three decimals
+and identical offsets in every case. Lingua already handles both, so there was
+nothing to gain and the change was dropped rather than carried for the look of
+it.
+
 ## 3.0.0
 
 **Braille is no longer limited to one table at a line.** Each language run is

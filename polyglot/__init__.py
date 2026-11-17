@@ -9,9 +9,20 @@ approve with ``orca --approve-extension polyglot``; Orca re-checks the
 hash of every file in the package on each start, so re-approve after
 editing. The venv, custom character names and debug log live outside the
 package for exactly that reason -- see ``speech_interceptor._DATA_DIR``.
+
+Copyright (C) Toby Heath and contributors.
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version. It is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY, without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License for more details. You should have received a copy of it
+along with this program; if not, see <https://www.gnu.org/licenses/>.
 """
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 import logging
 
@@ -48,7 +59,7 @@ class Polyglot(Extension):
 
     GROUP_LABEL = "Polyglot"
     DESCRIPTION = "Detects the language of text as Orca speaks it and switches voice and braille contraction table to match, and announces emoji, emoticons and Unicode characters by name."
-    VERSION = "3.0.0"  # keep in sync with __version__; read by AST, must be a literal
+    VERSION = "3.1.0"  # keep in sync with __version__; read by AST, must be a literal
     AUTHOR = "Toby"
     # Read by Orca without importing this module, and by Extension Updater
     # to find this add-on's releases. Orca shows it as a link in

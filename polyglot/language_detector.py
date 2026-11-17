@@ -222,6 +222,27 @@ _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+|\n+')
 # to block Orca's main thread; per-sentence calls each return quickly.
 _MIXED_CHUNK_THRESHOLD = 30
 
+#: Characters that end a sentence, for :func:`sentence_window`.
+_SENTENCE_ENDS = frozenset(".!?\u3002\u061f\u0964\u0965\u0589\u137c\uff01\uff1f\n")
+#: How far :func:`sentence_window` will widen a span, each way.
+CONTEXT_CHARACTERS = 200
+#: Confidence a foreign fragment surrounded by default-language text must
+#: reach, judged between it and the default alone. Deliberately far above
+#: the ordinary switch threshold: an embedded claim is a surprising one.
+#:
+#: Measured against the cases that motivated it, as a two-way score (see
+#: ``LanguageDetector.two_way_confidence``):
+#:
+#: 1. ``/usr/bin/gh`` as German -- 0.598, rejected. The live Mantis bug.
+#: 2. ``slash enfr`` as Spanish -- 0.350, rejected.
+#: 3. A lone ``ein`` as German -- 0.764, rejected.
+#: 4. ``Das ist ein deutscher Satz`` -- 0.992, accepted.
+#: 5. ``Dies ist wirklich ein sehr deutscher Satz`` -- 0.9995, accepted.
+#:
+#: Taken from Dialingo, an NVDA add-on by Rashad Naqeeb, which uses the
+#: same idea at the same value against fastText rather than Lingua.
+EMBEDDED_FLOOR = 0.98
+
 # Hard ceiling for any single chunk passed to detect_multiple_languages_of.
 # If sentence splitting leaves a chunk longer than this (e.g., unpunctuated
 # prose), we fall back to a fixed word-count split so no individual call
@@ -264,6 +285,70 @@ def _filter_natural_words(text):
     return natural
 
 
+def sentence_window(text, start, end, limit=CONTEXT_CHARACTERS):
+    """``(a, b)``: the span of ``text`` holding ``[start, end)``, widened to
+    the sentences the span cuts.
+
+    Short text cannot be identified statistically -- a forty-cell braille
+    line is usually a handful of words -- but the sentences around it can
+    be. So detection runs on the window and the answer is sliced back to
+    the span with :func:`slice_runs`.
+
+    Widening stops at a newline, which ends a paragraph, and after ``limit``
+    characters either way, there at a space rather than mid-word.
+    """
+    a = start
+    floor = max(0, start - limit)
+    while a > floor:
+        before = text[a - 1]
+        if before == "\n" or (
+                before.isspace() and a >= 2 and text[a - 2] in _SENTENCE_ENDS):
+            break
+        a -= 1
+    if a == floor and floor > 0:
+        # Stopped on the limit, not a boundary: do not start mid-word.
+        while a < start and not text[a - 1].isspace():
+            a += 1
+
+    b = end
+    ceiling = min(len(text), end + limit)
+    # A span ending in its sentence's full stop needs no widening to the
+    # right. Trailing spaces belong to the span, so look past them first.
+    tail = end
+    while tail > start and text[tail - 1].isspace() and text[tail - 1] != "\n":
+        tail -= 1
+    if tail > start and text[tail - 1] not in _SENTENCE_ENDS:
+        while b < ceiling:
+            char = text[b]
+            if char == "\n":
+                break
+            b += 1
+            if char in _SENTENCE_ENDS and (b == len(text) or text[b].isspace()):
+                break
+        if b == ceiling and ceiling < len(text):
+            while b > end and not text[b].isspace():
+                b -= 1
+    return a, b
+
+
+def slice_runs(runs, start, end):
+    """The ``(text, language)`` runs of ``runs`` lying over ``[start, end)``.
+
+    ``runs`` are consecutive slices of one text, as ``detect_mixed``
+    returns them, so their lengths place them. The counterpart to
+    :func:`sentence_window`: detect on the window, keep the span.
+    """
+    kept = []
+    position = 0
+    for run_text, language in runs:
+        run_start, run_end = position, position + len(run_text)
+        position = run_end
+        low, high = max(run_start, start), min(run_end, end)
+        if low < high:
+            kept.append((run_text[low - run_start:high - run_start], language))
+    return kept
+
+
 class LanguageDetector:
     """Two-tier language detector with word threshold for stability."""
 
@@ -292,11 +377,17 @@ class LanguageDetector:
         # _cached_lingua_detect_with_confidence for why this is not an
         # lru_cache on the method.
         self._lingua_cache = {}
+        # (text, candidate) -> the two-way score. Separate from
+        # _lingua_cache, which holds a different shape of answer.
+        self._two_way_cache = {}
         # A DictionaryDetector, or None to leave that tier out.
         self._dictionaries = dictionaries
         self._detection_order = normalize_detection_order(detection_order)
         # The last dictionary verdict, kept so the log can say why.
         self._last_dictionary_verdict = None
+        # The segments the embedded floor last turned down, as
+        # (text, language, score), kept so the log can say why.
+        self._last_embedded_rejections = []
 
         # Allow user override of confidence threshold
         if switch_confidence is not None:
@@ -502,6 +593,11 @@ class LanguageDetector:
         """The most recent dictionary verdict, for logging. May be None."""
         return self._last_dictionary_verdict
 
+    @property
+    def last_embedded_rejections(self):
+        """The segments the embedded floor last turned down, as
+        ``(text, language, score)`` -- for the caller's log."""
+        return list(self._last_embedded_rejections)
     def _detect_with_lingua(self, text, natural_word_count):
         """Tier: the statistical model. Returns a language or None.
 
@@ -658,6 +754,131 @@ class LanguageDetector:
 
         return None
 
+    def two_way_confidence(self, text, candidate):
+        """How confident ``candidate`` is for ``text`` judged against the
+        default language *alone*, from 0.0 to 1.0.
+
+        Lingua's own confidences are shared out across every configured
+        language, so a value shrinks as more languages are enabled and is
+        not comparable between installations. Renormalising the two that
+        matter -- the candidate and the default -- gives a score that means
+        the same thing however many languages are on, and asks the question
+        that matters for an embedded fragment: of these two, which is it?
+
+        One Lingua call, so this costs the same as any other detection.
+        Returns 0.0 when there is no default language, no model, or neither
+        language scores at all.
+        """
+        detector = self._mixed_detector or self._lingua_detector
+        if detector is None or not self._default_language or not text.strip():
+            return 0.0
+        if candidate == self._default_language:
+            return 0.0
+        key = (text, candidate)
+        cached = self._two_way_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            values = detector.compute_language_confidence_values(text)
+        except Exception:
+            # A detection failure must never cost the reader their braille:
+            # scoring 0.0 keeps the fragment in the default table.
+            return 0.0
+        scores = {}
+        for value in values:
+            code = _LINGUA_LANG_MAP.get(value.language)
+            if code:
+                scores[code] = value.value
+        mine = scores.get(candidate, 0.0)
+        theirs = scores.get(self._default_language, 0.0)
+        total = mine + theirs
+        result = (mine / total) if total > 0 else 0.0
+        if len(self._two_way_cache) >= _LINGUA_CACHE_SIZE:
+            self._two_way_cache.clear()
+        self._two_way_cache[key] = result
+        return result
+
+    def _survives_embedded_floor(self, segments):
+        """Relabel a foreign segment that sits among default-language ones
+        unless it is near certain, and say which were relabelled.
+
+        A fragment surrounded by the default language is making a
+        surprising claim, so it is held to :data:`EMBEDDED_FLOOR` rather
+        than the ordinary switch threshold. The case this was built for: a
+        KeePassXC notification ending in ``/usr/bin/gh``, where Lingua
+        marked the path German and braille then showed it in a German
+        table. The path scores 0.598 against English and is now kept in the
+        default table; a real German clause scores above 0.99 and stands.
+
+        A segment with no default-language neighbour is left alone -- it is
+        not embedded in anything, and a wholly foreign line is not a
+        surprising claim.
+        """
+        if not self._default_language or len(segments) < 2:
+            return segments, []
+        checked = []
+        rejected = []
+        for index, (text, lang) in enumerate(segments):
+            if lang != self._default_language:
+                neighbours = [
+                    segments[other][1]
+                    for other in (index - 1, index + 1)
+                    if 0 <= other < len(segments)
+                ]
+                if neighbours and all(
+                        other == self._default_language for other in neighbours):
+                    score = self.two_way_confidence(text, lang)
+                    if score < EMBEDDED_FLOOR:
+                        rejected.append((text, lang, score))
+                        lang = self._default_language
+            checked.append((text, lang))
+        return checked, rejected
+
+    def detect_mixed_in_context(self, text, start, end):
+        """``detect_mixed`` for ``text[start:end]``, decided by the
+        sentences around it.
+
+        ``detect_mixed`` declines text under eight words, because a handful
+        of words is not enough evidence -- and a braille line is usually a
+        handful of words, so on a display it declines nearly everything.
+        The words around it are evidence though, and they are right there
+        in the same paragraph. So the window is detected and the answer cut
+        back down to the span asked about.
+
+        Returns runs covering exactly ``text[start:end]``, or None.
+        """
+        if not text or not 0 <= start < end <= len(text):
+            return None
+        low, high = sentence_window(text, start, end)
+        span = text[start:end]
+        if (low, high) == (start, end):
+            # No wider context to be had: nothing a second call would add.
+            return self.detect_mixed(span)
+
+        window = text[low:high]
+        runs = self.detect_mixed(window)
+        if runs:
+            return slice_runs(runs, start - low, end - low) or None
+
+        # ``detect_mixed`` answers None for a window with only one language
+        # in it, which is the ordinary case for a paragraph. That answer is
+        # still worth having for a line too short to judge alone: a German
+        # line in a German paragraph is German. Scored rather than detected,
+        # because ``detect`` commits to what it finds and this runs on a
+        # braille redraw, which must not move the voice.
+        if self._lingua_detector is None:
+            # Fewer than two languages have a Lingua model, so there is
+            # nothing for it to choose between.
+            return None
+        detected, confidence = self._cached_lingua_detect_with_confidence(window)
+        if not detected:
+            return None
+        if (self._default_language
+                and detected != self._default_language
+                and confidence < self._SWITCH_AWAY_CONFIDENCE):
+            return None
+        return [(span, detected)]
+
     def _validate_segments(self, segments):
         """Correct Lingua's segment languages against the word lists, and merge.
 
@@ -687,6 +908,12 @@ class LanguageDetector:
                 if decided and decided != lang:
                     lang = decided
             corrected.append((text, lang))
+
+        corrected, rejected = self._survives_embedded_floor(corrected)
+        # Kept rather than logged, as the dictionary verdict is: the
+        # detector has no logger of its own and the caller knows where its
+        # log lives. See last_embedded_rejections.
+        self._last_embedded_rejections = rejected
 
         merged = []
         for text, lang in corrected:

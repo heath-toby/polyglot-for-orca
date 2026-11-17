@@ -75,6 +75,9 @@ _DEFAULTS = {
     # opens in the first table and closes in the last instead of being
     # opened and closed twice.
     "braille_join_emphasis": True,
+    # Decide a braille line too short to identify by the sentences around
+    # it in the focused object, rather than by the line alone.
+    "braille_line_context": True,
     # off | markup_only | markup_text | always.
     # markup_text preserves prior behaviour: trust Orca's language hints
     # (markup, AT-SPI, Orca's own detector) when present, else fall back
@@ -119,6 +122,7 @@ _TOP_LEVEL_KEYS = (
     ("mixed_max_words", "mixed-max-words", "int"),
     ("braille_mixed_language", "braille-mixed-language", "bool"),
     ("braille_join_emphasis", "braille-join-emphasis", "bool"),
+    ("braille_line_context", "braille-line-context", "bool"),
     ("detection_mode", "detection-mode", "str"),
     ("ignored_apps", "ignored-apps", "strlist"),
     ("detection_order", "detection-order", "strlist"),
@@ -413,6 +417,7 @@ class Config:
         self.enable_mixed_language = _DEFAULTS["enable_mixed_language"]
         self.braille_mixed_language = _DEFAULTS["braille_mixed_language"]
         self.braille_join_emphasis = _DEFAULTS["braille_join_emphasis"]
+        self.braille_line_context = _DEFAULTS["braille_line_context"]
         self.mixed_max_words = _DEFAULTS["mixed_max_words"]
         self.detection_mode = _DEFAULTS["detection_mode"]
         self.ignored_apps = list(_DEFAULTS["ignored_apps"])
@@ -712,6 +717,8 @@ class Config:
                 "braille_mixed_language", self.braille_mixed_language)
             self.braille_join_emphasis = data.get(
                 "braille_join_emphasis", self.braille_join_emphasis)
+            self.braille_line_context = data.get(
+                "braille_line_context", self.braille_line_context)
             self.mixed_max_words = data.get("mixed_max_words", self.mixed_max_words)
             mode = data.get("detection_mode", self.detection_mode)
             if mode in ("off", "markup_only", "markup_text", "always"):
@@ -743,6 +750,7 @@ class Config:
             "enable_mixed_language": self.enable_mixed_language,
             "braille_mixed_language": self.braille_mixed_language,
             "braille_join_emphasis": self.braille_join_emphasis,
+            "braille_line_context": self.braille_line_context,
             "mixed_max_words": self.mixed_max_words,
             "detection_mode": self.detection_mode,
             "ignored_apps": self.ignored_apps,

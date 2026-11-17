@@ -463,6 +463,54 @@ even one whose own table supports it. Choose a default that has them --
 Other limit: a line longer than 2000 characters is shown in one table rather
 than segmented.
 
+#### Deciding a short line by the sentences around it
+
+Script detection carries most braille lines: one Cyrillic word is Cyrillic
+however few words surround it. Languages that share a script are the hard case
+-- script cannot tell English from German -- and that is where statistics have
+to decide. But statistical detection needs words, and a forty-cell line is a
+handful of them. Polyglot's mixed detector declines anything under eight words,
+so on a display it used to decline nearly everything and the line kept the
+default table.
+
+The words around the line are evidence, though, and they are in the same
+paragraph. So when a line is too short to judge, Polyglot reads the focused
+object's text, widens the line to the sentences it cuts (at most 200 characters
+either way, stopping at a paragraph break), detects *that*, and keeps the
+line's share of the answer. A three-word German line in a German paragraph now
+comes out in the German table.
+
+Two things make this safe to do on every redraw:
+
+1. **It never moves the voice.** The window is *scored*, not detected --
+   `detect()` commits to what it finds, and a braille redraw has no business
+   changing which voice is speaking.
+2. **It gives up quietly.** No focus, not a text object, text over 20,000
+   characters, or a line that is not in that text at all (braille shows plenty
+   that is not: the window title, a status bar, flat review) -- each of those
+   simply falls back to judging the line alone, as before.
+
+Turn it off with `braille_line_context` if a line's context ever misleads it.
+
+The idea is from [Dialingo](https://github.com/rashadnaqeeb/nvda-dialingo), an
+NVDA add-on by Rashad Naqeeb; see Credits.
+
+#### A higher bar for a fragment the default language surrounds
+
+A foreign fragment with default-language text either side of it is making a
+surprising claim, so it is held to a much higher confidence than an ordinary
+language switch -- 0.98, judged between it and the default alone rather than
+spread across every enabled language.
+
+This fixed a real fault found on the Mantis within a minute of switching mixed
+braille on: a KeePassXC notification ending in the path `/usr/bin/gh` came back
+with the path marked German, and the path was then contracted in a German
+grade-1 table. The path scores 0.598 against English and now stays in the
+default table. A genuine German clause scores above 0.99 and still switches.
+
+Measured, not guessed -- the figures are in the `EMBEDDED_FLOOR` docstring, and
+`tests-context-window.py` holds each case as a row.
+
 #### Seeing what it did
 
     ./tools/braille-tables.py "the word is привет here"
@@ -511,4 +559,35 @@ you: a wrong cell still feels like a cell.
 
 ## License
 
-This project is free software. You may use, modify, and distribute it freely.
+GPL-3.0-or-later. The full text is in [LICENSE](LICENSE).
+
+Version 3 rather than 2 for a concrete reason: Polyglot imports
+[Lingua](https://github.com/pemistahl/lingua-py), which is Apache-2.0, and
+Apache-2.0's patent-termination clause counts as an additional restriction
+under GPL-2.0, which GPL-2.0 forbids. GPL-3.0 accommodates it explicitly, so
+version 3 is the version that can actually be combined with what Polyglot
+already uses. Orca itself is LGPL-2.1-or-later and the `emoji` package is
+BSD, both of which are fine either way.
+
+One consequence worth recording: GPL-2.0-only code cannot be taken into this
+project. That rules out lifting code from Dialingo (see Credits), which is
+GPL-2.0 — its ideas are credited and reimplemented here rather than copied.
+
+## Credits
+
+The braille and detection work owes two ideas to
+[Dialingo](https://github.com/rashadnaqeeb/nvda-dialingo), an NVDA add-on by
+Rashad Naqeeb that does language detection with fastText:
+
+1. **Deciding a short line by the sentences around it.** A forty-cell
+   braille line is a handful of words, and statistical detection needs more
+   than that. Dialingo's `sentence_window` widens the span to the sentences
+   it cuts and slices the answer back down. Polyglot does the same, in
+   `sentence_window` and `slice_runs`.
+2. **A higher bar for a surprising claim.** A foreign fragment surrounded by
+   default-language text is held to `EMBEDDED_FLOOR` rather than the
+   ordinary switch threshold. Dialingo's worked example is a good one: "only
+   English knows 'slash'".
+
+Both are reimplemented against Lingua rather than copied, and the thresholds
+were measured here rather than carried over.
