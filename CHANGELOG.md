@@ -1,5 +1,55 @@
 # Changelog
 
+## 3.2.0
+
+**Mixed-language speech now works on a line read.** It never had. Toby found
+it the moment braille started doing the job properly:
+
+> *"I am amazed to say it, but the braille is right where the speech is wrong.
+> I have a sentence in a LibreOffice document. The first part of this is in
+> English, aber der Zweiten auf Deutsch. The braille reads the first part in
+> English, the second in German, exactly as intended. If I issue Read Line, the
+> German voice reads the whole line."*
+
+`SpeechPresenter._speak` takes, in Orca's own words, "a string or a list from
+the speech generator" -- and `speak_line` passes the **list**. Both of
+Polyglot's language blocks were guarded on `isinstance(text, str)`, so on a
+line read neither ran: no per-segment voices, and not even the single-language
+detection. The language came from the whole-line detector instead, and for this
+sentence Lingua calls the whole line German at 0.9999999999, because "aber der
+auf" is about as German as text gets. Braille was unaffected throughout because
+it splits at the liblouis seam, downstream of all of this.
+
+This is the second bug of exactly this shape. The emoticon expansion hit the
+same wall and the comment explaining it was already sitting in the file a few
+hundred lines below the code that needed it.
+
+The fix rebuilds the utterance list, and the interesting part is that
+`_speak_list`'s protocol is not what it looks like:
+
+1. Strings pile up; an `ACSS` element claims the text *around* it, so the last
+   ACSS of a group wins for the whole group.
+2. A `Pause` is the only thing that reliably flushes a group.
+
+So two languages need `[ACSS, text, Pause, ACSS, text]` -- and the pause goes
+**between** runs only, never after the last one, because Orca appends a full
+stop at every pause and a trailing one would put a stop on the end of every
+line.
+
+Rebuilt rather than spoken directly: Orca's `_speak_list` already knows how to
+merge and flush groups, and reimplementing that is exactly how voices end up on
+the wrong side of a boundary. A list that needs no splitting is passed through
+untouched, and any failure falls back to the original list.
+
+18 new test rows, and they do not check the list's shape -- a plausible-looking
+list can still put the German voice on the English half. They run the rebuilt
+list through **Orca's own `_speak_list`** with the synthesiser call stubbed, and
+check which text came out in which voice.
+
+Cost on a line read: 0.23 ms for a mixed line, and the short fragments an
+utterance list carries (role names, "button", "3 of 7") are free -- they fail
+the eight-word floor immediately.
+
 ## 3.1.0
 
 Two ideas borrowed from [Dialingo](https://github.com/rashadnaqeeb/nvda-dialingo),

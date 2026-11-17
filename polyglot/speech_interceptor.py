@@ -2373,6 +2373,81 @@ def _end_with_boundary(text: str) -> str:
 
 
 
+def split_utterance_list(content, segments_of, acss_of, pause, acss_type):
+    """Rebuild one of Orca's utterance lists so each language gets its voice.
+
+    ``SpeechPresenter._speak`` takes "a string or a list from the speech
+    generator", and ``speak_line`` passes the list -- so a line read never
+    reached the string branch that does mixed-language speech. Braille was
+    splitting a line correctly while the whole line was read in one voice.
+
+    The list protocol is ``_speak_list``'s, and it is not obvious:
+
+    1. Strings pile up in ``to_speak``.
+    2. An ``ACSS`` element moves that pile to ``pending_text`` and becomes
+       the active voice -- so it sets the voice for the text *around* it,
+       and the last ACSS of a group wins for the whole group.
+    3. A ``Pause`` is the only thing that reliably *flushes*: it speaks what
+       has piled up in the voice active at that moment.
+
+    So giving two languages two voices means ``[ACSS, text, Pause, ACSS,
+    text, Pause]`` -- the pause after each run is what stops the next run's
+    voice claiming it. That is also why a boundary is audible here without
+    any sleeping on the main loop.
+
+    Returns a new list, or None when nothing needed splitting -- in which
+    case the caller must pass the original list through untouched.
+    """
+    rebuilt = []
+    split_anything = False
+    for element in content:
+        if not isinstance(element, str) or not element.strip():
+            rebuilt.append(element)
+            continue
+        runs = segments_of(element)
+        if not runs or len({lang for _t, lang in runs}) < 2:
+            rebuilt.append(element)
+            continue
+        spoken_runs = [(text, lang) for text, lang in runs if text.strip()]
+        for index, (run_text, lang) in enumerate(spoken_runs):
+            run_acss = acss_of(lang)
+            if run_acss is not None and isinstance(run_acss, acss_type):
+                rebuilt.append(run_acss)
+            rebuilt.append(run_text)
+            # Between the runs only. A trailing pause would make
+            # _speak_list append a full stop to the end of the line --
+            # Orca adds one at every pause -- and the last run needs no
+            # flush anyway: _speak_list speaks what is left over in the
+            # voice that is active when the list runs out.
+            if index + 1 < len(spoken_runs):
+                rebuilt.append(pause())
+            split_anything = True
+    return rebuilt if split_anything else None
+
+
+def _acss_voice_name(acss):
+    """The synthesis voice an ACSS names, for the log. Never raises.
+
+    The family is a plain dict when we build it and a VoiceFamily object
+    after Orca's ``_resolve_acss`` has been over it, so both shapes have to
+    be read. "(none)" is the answer that matters: an utterance naming no
+    voice is spoken by whatever voice the previous one selected.
+    """
+    try:
+        from orca.acss import ACSS
+        from orca.speechserver import VoiceFamily
+        if acss is None:
+            return "(no acss)"
+        family = acss.get(ACSS.FAMILY)
+        if family is None:
+            return "(no family)"
+        name = (family.get(VoiceFamily.NAME)
+                if hasattr(family, "get") else None)
+        return name or "(none)"
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        return f"(unreadable: {type(error).__name__})"
+
+
 def _get_lang_acss(lang_code):
     """Build the ACSS for a language, or None if we do not handle it.
 
@@ -2519,7 +2594,40 @@ def _apply_patches():
                         if mark and index + 1 < len(pending):
                             if pending[index + 1][2] != lang_code:
                                 seg_text = _end_with_boundary(seg_text)
+                        if _DEBUG_ENABLED:
+                            _debug(f"_speak mixed: [{index}] {lang_code} "
+                                   f"voice={_acss_voice_name(seg_acss)} "
+                                   f"text={seg_text[:30]!r}")
                         _original_speak(seg_text, seg_acss, obj)
+                    return
+
+            # The same thing for a list, which is what a line read passes.
+            # Rebuilt rather than spoken here: Orca's own _speak_list knows
+            # how to merge and flush the groups, and reimplementing that is
+            # how the voices end up on the wrong side of a boundary.
+            if (_config.enabled and _config.enable_mixed_language and _detector
+                    and isinstance(content, list) and content
+                    and not _is_app_ignored()
+                    and _config.detection_mode in ("markup_text", "always")):
+                from orca.acss import ACSS as _ACSS
+                from orca.speech_generator import Pause as _Pause
+                rebuilt = split_utterance_list(
+                    content,
+                    segments_of=_detector.detect_mixed,
+                    acss_of=_get_lang_acss,
+                    pause=_Pause,
+                    acss_type=_ACSS,
+                )
+                if rebuilt is not None:
+                    if _DEBUG_ENABLED:
+                        _debug("_speak mixed list: "
+                               + " | ".join(
+                                   f"{_acss_voice_name(item)}"
+                                   if isinstance(item, _ACSS)
+                                   else (repr(item[:28])
+                                         if isinstance(item, str) else "PAUSE")
+                                   for item in rebuilt))
+                    _original_speak(rebuilt, acss, obj)
                     return
         except Exception as e:
             _debug(f"_speak mixed: ERROR {e}")
